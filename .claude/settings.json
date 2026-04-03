@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/PremkumarUthayakumar/Desktop/projects/New/ folder/auto-remediation/**)",
+      "Read(//c/Users/PremkumarUthayakumar/Desktop/projects/New folder/auto-remediation/*/.venv/**)",
+      "Read(//c/Users/PremkumarUthayakumar/.claude/projects/c--Users-PremkumarUthayakumar-Desktop-projects-New-folder-auto-remediation/fe490585-de6b-4561-b4f3-38717d3201cf/tool-results/**)",
+      "Read(//c/Users/PremkumarUthayakumar/Desktop/**)",
+      "Bash(python3 -c ':*)",
+      "Bash(uv run python -c ':*)",
+      "Bash(uv run:*)",
+      "Bash(uv add:*)",
+      "Bash(del \"c:\\\\Users\\\\PremkumarUthayakumar\\\\Desktop\\\\projects\\\\New folder\\\\auto-remediation\\\\debug_pw_login.py\")"
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+fastmcp
+sap-ai-sdk-gen
+python-dotenv
+fastapi
+yaspin
+pydantic
+anyio
+asyncio
+yaspin
+uvicorn[standard]
+hdbcli
+boto3
+tabulate
