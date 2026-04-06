@@ -1403,7 +1403,8 @@ async def retry_fix(
         )
 
     # ── Decide retry strategy based on what failed ──────────────────────────
-    # deploy stage: update already applied — skip get+update, just redeploy
+    # deploy stage (timeout/infra): update already applied — skip get+update, just redeploy
+    # deploy_validation: iFlow content itself was rejected by SAP CPI build — must re-fix from scratch
     deploy_only = last_failed_stage == "deploy"
 
     # For update/agent failures with low confidence: re-run RCA first to get

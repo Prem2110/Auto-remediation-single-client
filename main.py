@@ -486,6 +486,10 @@ Review the modified iFlow XML against these rules. If any check fails, correct t
      Stick to modifying existing component properties only unless the proposed fix explicitly
      requires a structural change AND you have verified the version/type is IFLMAP-compatible.
   d. No forbidden components: SOAP 1.1 adapter is forbidden. HTTP adapter is the safe alternative.
+  e. Content Modifier Header rows: in the iFlow XML, every <Row> element inside a Headers property block
+     MUST have srcType="Expression" (NOT srcType="Constant"). If you added or modified any Header row
+     and used srcType="Constant", change it to srcType="Expression" now — SAP CPI will reject the upload
+     otherwise. A literal string value such as "application/json" is perfectly valid as an Expression.
 
 STEP 3: Call deploy-iflow tool with iFlow ID: "{iflow_id}"
          → VERIFY the response contains deployStatus "Success" or "DEPLOYED".
@@ -1339,7 +1343,7 @@ class MultiMCP:
         failed_stage: str = "",
     ) -> str:
         if not fix_success:
-            if failed_stage == "deploy":
+            if failed_stage in ("deploy", "deploy_validation"):
                 return "FIX_FAILED_DEPLOY"
             if failed_stage in ("update", "get"):
                 return "FIX_FAILED_UPDATE"
@@ -2091,6 +2095,10 @@ Execution policy:
                     f"   - SOAP 1.1 adapter not supported: replace it with an HTTP adapter using the same endpoint URL.\n"
                     f"   - 'cannot process the message type passed by element': remove the incompatible converter "
                     f"or fix the connection so the message type matches.\n"
+                    f"   - 'Invalid value \\'Constant\\' entered in \\'Source Type\\' field in \\'Headers\\' table': "
+                    f"In Content Modifier Header rows the XML attribute srcType must be 'Expression' (not 'Constant'). "
+                    f"Change every Headers row that has srcType=\"Constant\" to srcType=\"Expression\". "
+                    f"A literal string value like 'application/json' is valid as an Expression in SAP CPI.\n"
                     f"   - Do NOT add any new components beyond what is needed to satisfy the listed errors.\n"
                     f"3. Call update-iflow with the corrected iFlow.\n"
                     f"4. Call deploy-iflow with iFlow ID '{iflow_id}'.\n\n"
@@ -2126,6 +2134,7 @@ Execution policy:
                         logger.warning(
                             f"[FIX_DEPLOY] Self-correction pass did not resolve deploy errors for '{iflow_id}'"
                         )
+                        evaluation["failed_stage"] = "deploy_validation"
                         evaluation["technical_details"] = (
                             f"Original deploy errors: {deploy_errors[:600]}\n"
                             f"Correction pass result: {eval_corr.get('technical_details', '')}"
@@ -2925,7 +2934,9 @@ Rules:
             fix_result = await self.apply_fix(working_incident, rca)
         policy = self.get_remediation_policy(working_incident, rca)
         retry_result = None
-        fix_summary = fix_result.get("summary", "")
+        fix_summary = fix_result.get("summary", "") or ""
+        if not fix_summary and fix_result.get("success"):
+            fix_summary = f"iFlow '{working_incident.get('iflow_id', '')}' updated and deployed successfully."
 
         if fix_result.get("failed_stage") == "deploy" or (
             fix_result.get("fix_applied") and not fix_result.get("deploy_success")
