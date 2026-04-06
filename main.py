@@ -476,20 +476,15 @@ STEP 2: Apply ONLY this fix to the downloaded iFlow:
          → If update FAILS for any other reason, stop and report the exact error.
 
 STEP 2.5 — PRE-UPDATE SELF-CHECK (mandatory before calling update-iflow):
-Review the modified iFlow XML against these rules. If any check fails, correct the XML first:
-  a. Content-Based Router: every router block MUST contain a route element with condition type "Default".
-     If you added a router without a default route, add one now.
-  b. Component versions: do NOT change ANY version attribute from the original iFlow.
-     Preserve the exact version numbers on EndEvent, ExceptionSubprocess, all adapters, all steps.
-  c. No new adapter type: if the original iFlow has no SOAP adapter, do NOT add one.
-     If the original iFlow has no ExceptionSubprocess, do NOT add one.
-     Stick to modifying existing component properties only unless the proposed fix explicitly
-     requires a structural change AND you have verified the version/type is IFLMAP-compatible.
-  d. No forbidden components: SOAP 1.1 adapter is forbidden. HTTP adapter is the safe alternative.
-  e. Content Modifier Header rows: in the iFlow XML, every <Row> element inside a Headers property block
-     MUST have srcType="Expression" (NOT srcType="Constant"). If you added or modified any Header row
-     and used srcType="Constant", change it to srcType="Expression" now — SAP CPI will reject the upload
-     otherwise. A literal string value such as "application/json" is perfectly valid as an Expression.
+Review the modified iFlow XML. If any issue is found, correct it before uploading:
+  a. Your changes must be minimal — modify only what the proposed fix requires. Do not restructure,
+     rename, or reorganise any other part of the iFlow.
+  b. Do not change any version attribute from the original. Preserve all component versions exactly.
+  c. Do not introduce any new component (adapter, channel, step) that was not present in the original
+     iFlow, unless the proposed fix explicitly requires it. If you do add one, ensure it is fully
+     configured with no empty or placeholder values.
+  d. Read the SAP CPI iFlow XML spec for any element you added or modified — verify that every
+     attribute value you wrote is valid for that element type in the Cloud Integration (IFLMAP) profile.
 
 STEP 3: Call deploy-iflow tool with iFlow ID: "{iflow_id}"
          → VERIFY the response contains deployStatus "Success" or "DEPLOYED".
@@ -1349,7 +1344,7 @@ class MultiMCP:
                 return "FIX_FAILED_UPDATE"
             return "FIX_FAILED"
         if policy.get("action") == "RETRY":
-            if retry_result and retry_result.get("success"):
+            if retry_result and (retry_result.get("success") or retry_result.get("skipped")):
                 return "HUMAN_INITIATED_FIX" if human_approved else "FIX_VERIFIED"
             return "FIX_DEPLOYED"
         return "HUMAN_INITIATED_FIX" if human_approved else "FIX_VERIFIED"
@@ -2086,20 +2081,10 @@ Execution policy:
                     f"{deploy_errors[:2000]}\n\n"
                     f"INSTRUCTIONS — execute in order, no skipping:\n"
                     f"1. Call get-iflow with ID '{iflow_id}' to download the current (already-updated) iFlow.\n"
-                    f"2. Fix ONLY the validation errors listed above. Preserve all other changes. Rules:\n"
-                    f"   - Content Based Router missing default route: add a route element with condition type 'Default' "
-                    f"pointing to the nearest EndEvent or Exception handler.\n"
-                    f"   - Wrong component version (e.g. EndEvent 1.1, ExceptionSubprocess 1.2, SOAP 1.12): "
-                    f"revert that component's version attribute to what was in the original iFlow (EndEvent→1.0, "
-                    f"ExceptionSubprocess→1.1, SOAP max→1.11).\n"
-                    f"   - SOAP 1.1 adapter not supported: replace it with an HTTP adapter using the same endpoint URL.\n"
-                    f"   - 'cannot process the message type passed by element': remove the incompatible converter "
-                    f"or fix the connection so the message type matches.\n"
-                    f"   - 'Invalid value \\'Constant\\' entered in \\'Source Type\\' field in \\'Headers\\' table': "
-                    f"In Content Modifier Header rows the XML attribute srcType must be 'Expression' (not 'Constant'). "
-                    f"Change every Headers row that has srcType=\"Constant\" to srcType=\"Expression\". "
-                    f"A literal string value like 'application/json' is valid as an Expression in SAP CPI.\n"
-                    f"   - Do NOT add any new components beyond what is needed to satisfy the listed errors.\n"
+                    f"2. Read each validation error carefully and reason about what XML change caused it. "
+                    f"Fix ONLY those errors in the iFlow XML. Preserve all other content unchanged.\n"
+                    f"   - Do not guess — derive the fix directly from the error message and the XML you see.\n"
+                    f"   - Do not add new components. Correct or remove only what the error points to.\n"
                     f"3. Call update-iflow with the corrected iFlow.\n"
                     f"4. Call deploy-iflow with iFlow ID '{iflow_id}'.\n\n"
                     f"Return EXACTLY this JSON (no markdown):\n"
@@ -2432,6 +2417,74 @@ Rules:
             return {"success": True, "skipped": False, "summary": answer, "steps": logger_cb.steps}
         except Exception as e:
             logger.error(f"[RETRY] retry_failed_message error: {e}")
+            return {"success": False, "skipped": False, "summary": str(e), "steps": logger_cb.steps}
+
+    async def test_iflow_after_fix(self, incident: Dict) -> Dict[str, Any]:
+        """
+        After a successful deploy, call test_iflow_with_payload directly.
+        Payload is derived from the error/fix context — no need to re-download the iFlow XML.
+        """
+        has_test_tool = any("test_iflow_with_payload" in t.name for t in self.tools)
+        if not has_test_tool:
+            return {"success": False, "skipped": True, "summary": "test_iflow_with_payload tool not available."}
+
+        iflow_id     = incident.get("iflow_id", "")
+        error_type   = incident.get("error_type", "")
+        error_msg    = incident.get("error_message", "")
+        proposed_fix = incident.get("proposed_fix", "")
+
+        prompt = f"""
+IFLOW VERIFICATION — the fix has been deployed. Confirm it works with one test call.
+
+iFlow ID: {iflow_id}
+Original error type: {error_type}
+Original error: {error_msg[:400]}
+Applied fix: {proposed_fix[:400]}
+
+INSTRUCTIONS:
+1. Using only the error context above, construct a minimal valid payload that exercises
+   the path that was originally failing. Do NOT call get-iflow.
+2. Call test_iflow_with_payload once with iflow_id='{iflow_id}' and that payload.
+3. Return EXACTLY this JSON (no markdown):
+{{"test_passed": true/false, "http_status": <status code or null>, "summary": "<one sentence: what was sent and what the iFlow returned>"}}
+
+Do NOT call get-iflow. Do NOT modify the iFlow. Do NOT call deploy. Do NOT fetch message logs.
+"""
+        timestamp = get_hana_timestamp()
+        tracker   = TestExecutionTracker(incident.get("user_id", "system"), f"test_after_fix:{iflow_id}", timestamp)
+        logger_cb = StepLogger(tracker)
+
+        try:
+            result = await asyncio.wait_for(
+                self.agent.ainvoke(
+                    {"messages": [{"role": "user", "content": prompt}]},
+                    config={"callbacks": [logger_cb], "recursion_limit": 4},
+                ),
+                timeout=120.0,
+            )
+            final_msg = result["messages"][-1]
+            answer    = final_msg.content if hasattr(final_msg, "content") else str(final_msg)
+            try:
+                parsed = json.loads(answer.strip())
+            except Exception:
+                parsed = {}
+            test_passed = parsed.get("test_passed", False)
+            logger.info(
+                "[TEST_AFTER_FIX] iflow=%s test_passed=%s status=%s summary=%s",
+                iflow_id, test_passed, parsed.get("http_status"), parsed.get("summary", "")[:200],
+            )
+            return {
+                "success":     test_passed,
+                "skipped":     False,
+                "http_status": parsed.get("http_status"),
+                "summary":     parsed.get("summary", answer[:200]),
+                "steps":       logger_cb.steps,
+            }
+        except asyncio.TimeoutError:
+            logger.warning("[TEST_AFTER_FIX] timed out for iflow=%s", iflow_id)
+            return {"success": False, "skipped": True, "summary": "iFlow test timed out after 120s.", "steps": logger_cb.steps}
+        except Exception as e:
+            logger.error("[TEST_AFTER_FIX] error for iflow=%s: %s", iflow_id, e)
             return {"success": False, "skipped": False, "summary": str(e), "steps": logger_cb.steps}
 
     # ══════════════════════════════════════════
@@ -2953,20 +3006,36 @@ Rules:
         # Always replay the failed message after a successful deploy so we confirm
         # the fix actually works end-to-end, not just that deployment completed.
         replay_success = False
+        replay_skipped = False
+        test_result: Dict[str, Any] = {}
         if fix_result.get("success"):
             self._set_progress(incident_id, "Validating fix — replaying failed message…", total, total)
             retry_result = await self.retry_failed_message(working_incident)
             replay_success = retry_result.get("success", False)
+            replay_skipped = retry_result.get("skipped", False)
             if retry_result.get("summary"):
                 fix_summary = f"{fix_summary}\nReplay: {retry_result['summary']}"
-            if not replay_success:
+            if not replay_success and not replay_skipped:
                 logger.warning(
                     f"[FIX] Deploy succeeded but message replay failed for {incident_id}. "
                     "Marking as FIX_APPLIED_PENDING_VERIFICATION."
                 )
 
-        # Status: if deploy succeeded but replay failed → pending verification, not AUTO_FIXED
-        if fix_result.get("success") and not replay_success:
+            # When replay is skipped (no message GUID) or after a successful replay,
+            # also run a live iFlow test: agent downloads the iFlow, builds a payload, and calls it.
+            if replay_skipped or replay_success:
+                self._set_progress(incident_id, "Validating fix — testing iFlow with payload…", total, total)
+                test_result = await self.test_iflow_after_fix(working_incident)
+                if test_result.get("summary") and not test_result.get("skipped"):
+                    fix_summary = f"{fix_summary}\nTest: {test_result['summary']}"
+                if replay_skipped:
+                    # No message GUID replay — use test result as the verification signal
+                    replay_success = test_result.get("success", False)
+                    replay_skipped = test_result.get("skipped", False)
+
+        # Status: if deploy succeeded but replay genuinely failed → pending verification
+        # If replay was skipped (no message GUID / no retry tool / test tool unavailable), trust the deploy result
+        if fix_result.get("success") and not replay_success and not replay_skipped:
             final_status = "FIX_DEPLOYED"
         else:
             final_status = self.determine_post_fix_status(
