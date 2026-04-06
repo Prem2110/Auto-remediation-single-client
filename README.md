@@ -18,7 +18,7 @@ An intelligent, autonomous SAP Cloud Platform Integration (CPI) monitoring and s
 - **Self-Healing Fix Pipeline** — Downloads iFlow config, applies AI-generated fix, updates and deploys — with automatic unlock handling and retry logic
 - **iFlow Example Reference** — Agent calls `list-iflow-examples` / `get-iflow-example` (MCP) to use stored S3 components as structural reference for complex fixes
 - **Deleted iFlow Detection** — Pre-flight verification prevents wasted fix attempts on deleted artifacts; marks incidents as `ARTIFACT_DELETED`
-- **HANA Vector Store Integration** — Semantic search over `CPI_KNOWLEDGE_BASE` retrieves top 5 relevant SAP notes to enrich RCA context
+- **HANA Vector Store Integration** — Cosine similarity search over `SAP_HELP_DOCS` (20,000+ scraped SAP notes, 3072-dim embeddings) retrieves top 5 relevant notes to enrich RCA context
 - **Internal Escalation Tickets** — Low-confidence incidents are escalated as tickets stored in HANA (`ESCALATION_TICKETS` table) — no external ticketing system required
 - **Smart Monitoring API** — Full REST backend for real-time monitoring UI (incidents, drill-down, apply fix, retry messages)
 - **Dashboard API** — KPI cards, charts, leaderboards, and drill-downs for analytics dashboard
@@ -71,8 +71,8 @@ External Services:
 ┌──────────────────────┐  ┌───────────────────┐  ┌──────────────────────┐
 │    SAP HANA Cloud    │  │   SAP AI Core     │  │       AWS S3         │
 │  Incidents · History │  │  LLM (GPT-5.2)    │  │  File uploads        │
-│  Fix patterns        │  │                   │  │  iFlow examples      │
-│  CPI_KNOWLEDGE_BASE  │  │                   │  │  (structural ref)    │
+│  Fix patterns        │  │  text-embedding   │  │  iFlow examples      │
+│  SAP_HELP_DOCS       │  │  -3-large (3072d) │  │  (structural ref)    │
 │  Escalation tickets  │  │                   │  │                      │
 └──────────────────────┘  └───────────────────┘  └──────────────────────┘
 ```
@@ -91,10 +91,11 @@ External Services:
 
 - Python 3.13+
 - SAP BTP account with Integration Suite access
-- SAP AI Core deployment with a supported LLM (GPT-5.2 / Claude)
+- SAP AI Core deployment (LLM + `text-embedding-3-large` embedding model)
 - SAP HANA Cloud database instance
 - AWS S3 bucket (for file uploads and iFlow example storage)
 - The three MCP servers deployed and reachable
+- Playwright Chromium browser (for `scrape_sap_docs.py` — install via `uv run playwright install chromium`)
 
 ---
 
@@ -121,10 +122,12 @@ pip install -r requirements.txt
 
 ### 3. Configure environment variables
 
-Create a `.env` file in the project root. All sections are required:
+Create a `.env` file in the project root.
+
+Legend: `[REQUIRED]` must be set or the app will not start / feature will not work. `[OPTIONAL]` has a safe default or enables a non-critical feature.
 
 ```env
-# ── SAP AI Core ───────────────────────────────────────────────────────
+# ── SAP AI Core ── [REQUIRED] ─────────────────────────────────────────
 AICORE_CLIENT_ID=your_client_id
 AICORE_CLIENT_SECRET=your_client_secret
 AICORE_AUTH_URL=https://your-tenant.authentication.region.hana.ondemand.com
@@ -132,42 +135,42 @@ AICORE_BASE_URL=https://api.ai.prod.region.aws.ml.hana.ondemand.com/v2
 AICORE_RESOURCE_GROUP=default
 LLM_DEPLOYMENT_ID=your_llm_deployment_id
 
-# ── LangSmith Tracing (optional) ─────────────────────────────────────
+# ── LangSmith Tracing ── [OPTIONAL] ──────────────────────────────────
 LANGSMITH_TRACING=true
 LANGSMITH_ENDPOINT=https://api.smith.langchain.com
 LANGSMITH_API_KEY=your_langsmith_key
 LANGSMITH_PROJECT=your_project_name
 
-# ── SAP Integration Suite — Runtime API ──────────────────────────────
+# ── SAP Integration Suite — Runtime API ── [REQUIRED] ────────────────
 API_BASE_URL=https://your-tenant.it-cpi019.cfapps.region.hana.ondemand.com/api/v1
 API_OAUTH_CLIENT_ID=your_client_id
 API_OAUTH_CLIENT_SECRET=your_client_secret
 API_OAUTH_TOKEN_URL=https://your-tenant.authentication.region.hana.ondemand.com/oauth/token
 
-# ── SAP Integration Suite — Monitor / CPI Runtime ────────────────────
+# ── SAP Integration Suite — Monitor / CPI Runtime ── [REQUIRED] ──────
 CPI_BASE_URL=https://your-tenant.it-cpi019-rt.cfapps.region.hana.ondemand.com
 CPI_OAUTH_CLIENT_ID=your_client_id
 CPI_OAUTH_CLIENT_SECRET=your_client_secret
 CPI_OAUTH_TOKEN_URL=https://your-tenant.authentication.region.hana.ondemand.com/oauth/token
 
-# ── SAP Integration Suite — Design Time ──────────────────────────────
+# ── SAP Integration Suite — Design Time ── [REQUIRED] ────────────────
 SAP_DESIGN_TIME_URL=https://your-tenant.it-cpi019.cfapps.region.hana.ondemand.com
 SAP_DESIGN_TIME_TOKEN_URL=https://your-tenant.authentication.region.hana.ondemand.com/oauth/token
 SAP_DESIGN_TIME_CLIENT_ID=your_client_id
 SAP_DESIGN_TIME_CLIENT_SECRET=your_client_secret
 
-# ── SAP Hub — Autonomous Error Polling ───────────────────────────────
+# ── SAP Hub — Autonomous Error Polling ── [REQUIRED] ─────────────────
 SAP_HUB_TENANT_URL=https://your-tenant.it-cpi019.cfapps.region.hana.ondemand.com
 SAP_HUB_TOKEN_URL=https://your-tenant.authentication.region.hana.ondemand.com/oauth/token
 SAP_HUB_CLIENT_ID=your_client_id
 SAP_HUB_CLIENT_SECRET=your_client_secret
 
-# ── MCP Servers ───────────────────────────────────────────────────────
+# ── MCP Servers ── [REQUIRED] ─────────────────────────────────────────
 MCP_INTEGRATION_SUITE_URL=https://your-integration-suite-mcp.cfapps.region.hana.ondemand.com/mcp
 MCP_TESTING_URL=https://your-testing-mcp.cfapps.region.hana.ondemand.com/mcp
 MCP_DOCUMENTATION_URL=https://your-documentation-mcp.cfapps.region.hana.ondemand.com/mcp
 
-# ── SAP HANA Cloud ────────────────────────────────────────────────────
+# ── SAP HANA Cloud ── [REQUIRED] ──────────────────────────────────────
 HANA_HOST=your-guid.hna0.prod-region.hanacloud.ondemand.com
 HANA_PORT=443
 HANA_USER=your_hdi_rt_user
@@ -176,9 +179,10 @@ HANA_SCHEMA=your_schema
 HANA_TABLE_QUERY_HISTORY=MCP_QUERY_HISTORY
 HANA_TABLE_USER_FILES=USER_FILES_METADATA
 HANA_TABLE_XSD_FILES=SAP_IS_XSD_FILES
-HANA_TABLE_VECTOR=CPI_KNOWLEDGE_BASE
+HANA_TABLE_VECTOR=SAP_HELP_DOCS          # table used for vector/RCA search
+HANA_TABLE_SAP_DOCS=SAP_HELP_DOCS        # table written to by scrape_sap_docs.py
 
-# ── AWS S3 Object Store ───────────────────────────────────────────────
+# ── AWS S3 Object Store ── [REQUIRED for file uploads & iFlow examples]
 BUCKET_NAME=your_bucket_name
 REGION=us-east-1
 ENDPOINT_URL=https://s3.amazonaws.com
@@ -190,7 +194,7 @@ WRITE_SECRET_ACCESS_KEY=your_write_secret
 READ_ACCESS_KEY_ID=your_read_key_id
 READ_SECRET_ACCESS_KEY=your_read_secret
 
-# ── Autonomous Operations ─────────────────────────────────────────────
+# ── Autonomous Operations ── [OPTIONAL — defaults shown] ─────────────
 AUTONOMOUS_ENABLED=false
 POLL_INTERVAL_SECONDS=60
 AUTO_FIX_CONFIDENCE=0.90
@@ -203,20 +207,52 @@ PENDING_APPROVAL_TIMEOUT_HRS=24
 PATTERN_MIN_SUCCESS_COUNT=2
 BURST_DEDUP_WINDOW_SECONDS=60
 
-# ── Escalation Tickets ────────────────────────────────────────────────
+# ── Escalation Tickets ── [OPTIONAL] ─────────────────────────────────
 TICKET_DEFAULT_ASSIGNEE=team@example.com   # leave blank to assign no default
 
-# ── Server & Logging ─────────────────────────────────────────────────
+# ── Server & Logging ── [OPTIONAL — defaults shown] ──────────────────
 API_HOST=0.0.0.0
 API_PORT=8080
 LOG_LEVEL=DEBUG
 ENABLE_CONSOLE_LOGS=false
 
-# ── File Upload ───────────────────────────────────────────────────────
+# ── File Upload ── [OPTIONAL — default: user] ─────────────────────────
 UPLOAD_ROOT=user
+
+# ── SAP Notes Scraper ── [REQUIRED only for scrape_sap_docs.py] ──────
+SAP_USERNAME=your_sap_user@example.com
+SAP_PASSWORD=your_sap_password
+SAP_NOTE_CONCURRENCY=10       # parallel Playwright pages (default: 5)
+SAP_NOTE_DELAY=0.3            # seconds between page requests (default: 1.0)
+
+# ── Embeddings ── [REQUIRED only for vectorize_docs.py] ──────────────
+EMBEDDING_DEPLOYMENT_ID=your_embedding_deployment_id
+EMBEDDING_MODEL_NAME=text-embedding-3-large
+VECTOR_DIMENSION=3072
 ```
 
-### 4. Run the server
+### 4. Build the SAP Notes knowledge base (one-time setup)
+
+Install Playwright browsers (required for scraping):
+```bash
+uv run playwright install chromium
+```
+
+Scrape SAP Notes from me.sap.com (split your URL list into files of ~500):
+```bash
+uv run scrape_sap_docs.py --notes-only --notes-file sap_notes_1.txt
+uv run scrape_sap_docs.py --notes-only --notes-file sap_notes_2.txt
+# ... repeat for each file
+```
+
+Vectorize all scraped notes (run once after scraping is complete):
+```bash
+uv run vectorize_docs.py
+```
+
+Both scripts are crash-safe — re-run at any time to resume from where they left off.
+
+### 5. Run the server
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8080 --reload
@@ -250,7 +286,7 @@ auto-remediation/
 ├── utils/
 │   ├── utils.py                   # HANA timestamp helpers
 │   ├── logger_config.py           # Rotating file logger setup
-│   ├── vector_store.py            # HANA CPI_KNOWLEDGE_BASE search for RCA context
+│   ├── vector_store.py            # HANA SAP_HELP_DOCS cosine similarity search for RCA
 │   └── xsd_handler.py             # XSD parsing and validation
 │
 ├── rules/                         # Coding standards for Claude Code
@@ -258,12 +294,36 @@ auto-remediation/
 │   ├── testing.md
 │   └── security.md
 │
+├── scrape_sap_docs.py             # Playwright-based scraper — me.sap.com SAP Notes → HANA
+├── vectorize_docs.py              # Generate 3072-dim embeddings for SAP_HELP_DOCS via AI Core
+│
 ├── logs/                          # Rotating application logs (mcp.log)
 ├── CLAUDE.md                      # Claude Code project instructions
 ├── .env                           # Secrets — never commit
 ├── requirements.txt               # Minimal dependency list
 └── pyproject.toml                 # Full dependency spec with versions
 ```
+
+---
+
+## Module Overview
+
+| File | Description |
+|---|---|
+| [main.py](main.py) | FastAPI app entry point — mounts all routers, initialises MultiMCP manager, runs the autonomous monitoring loop |
+| [smart_monitoring.py](smart_monitoring.py) | REST router for `/smart-monitoring/*` — incident management, RCA trigger, fix application, retry, rollback, escalation tickets |
+| [smart_monitoring_dashboard.py](smart_monitoring_dashboard.py) | REST router for `/dashboard/*` — KPI cards, charts, leaderboards, drill-downs, SLA metrics |
+| [generate_dashboard_pdf.py](generate_dashboard_pdf.py) | Exports the dashboard as a PDF report using headless browser rendering |
+| [scrape_sap_docs.py](scrape_sap_docs.py) | Playwright-based scraper — authenticates against me.sap.com via SAML2, scrapes SAP Note content, and writes chunks to `SAP_HELP_DOCS` in HANA (crash-safe, re-runnable) |
+| [vectorize_docs.py](vectorize_docs.py) | One-time vectorization script — reads un-embedded rows from `SAP_HELP_DOCS`, calls SAP AI Core (`text-embedding-3-large`), and writes 3072-dim vectors back (crash-safe, re-runnable) |
+| [config/config.py](config/config.py) | Loads and validates all settings from `.env` using Pydantic |
+| [db/database.py](db/database.py) | SAP HANA Cloud abstraction — CRUD operations for all tables (`AUTONOMOUS_INCIDENTS`, `FIX_PATTERNS`, `ESCALATION_TICKETS`, etc.) |
+| [storage/storage.py](storage/storage.py) | Handles file uploads — detects XSD files and routes them to the appropriate HANA table or S3 |
+| [storage/object_store.py](storage/object_store.py) | AWS S3 operations — read/write iFlow examples and user-uploaded files using separate read/write credentials |
+| [utils/utils.py](utils/utils.py) | HANA timestamp formatting helpers and shared utility functions |
+| [utils/logger_config.py](utils/logger_config.py) | Configures rotating file logger with structured JSON output; all production log calls go through this |
+| [utils/vector_store.py](utils/vector_store.py) | Retrieves top-N relevant SAP notes from `SAP_HELP_DOCS` using cosine similarity (REAL_VECTOR) with fuzzy-search fallback — used to enrich RCA prompts |
+| [utils/xsd_handler.py](utils/xsd_handler.py) | Parses and validates XSD schema files; extracts element/type counts and target namespace |
 
 ---
 
@@ -277,7 +337,7 @@ Error detected
       ├─── LangChain Agent                   ├─── Rule-based Classifier
       │    • Calls get_message_logs            │    • Keyword matching on error text
       │    • Retrieves SAP notes from vector   │    • Returns error_type + confidence
-      │      store (HANA CPI_KNOWLEDGE_BASE)   │
+      │      store (HANA SAP_HELP_DOCS)        │
       │    • Generates root_cause + fix        │
       │    • Returns confidence score          │
       │                                        │
@@ -287,9 +347,10 @@ Error detected
 ```
 
 **Vector Store Integration:**
-- Retrieves top 5 relevant SAP notes from `CPI_KNOWLEDGE_BASE` table
-- Uses HANA full-text fuzzy search based on error message, error type, and iFlow ID
-- Enriches RCA prompt with historical fix patterns and SAP documentation
+- Retrieves top 5 relevant SAP notes from `SAP_HELP_DOCS` table (20,000+ notes)
+- Uses cosine similarity search on 3072-dim embeddings (text-embedding-3-large via AI Core)
+- Falls back to HANA full-text fuzzy search if vector search returns no results
+- Enriches RCA prompt with SAP Note content and fix guidance
 
 ### Remediation Gate
 
@@ -551,6 +612,67 @@ On success the incident status transitions to `ROLLED_BACK`. Fails with `400` if
 
 ### Autonomous Operations
 
+#### What it is
+
+The autonomous loop is a background process that continuously monitors SAP CPI for failed messages and runtime artifact errors — without any human intervention. It polls SAP CPI on a configurable interval, runs AI-powered Root Cause Analysis on each new error, and either fixes the iFlow automatically or escalates it depending on the confidence score.
+
+#### What it does
+
+```
+Every POLL_INTERVAL_SECONDS:
+  1. Fetch all failed messages + runtime artifact errors from SAP CPI
+  2. Deduplicate — skip errors already tracked as incidents
+  3. For each new error:
+       a. Run RCA (LangChain agent + SAP Notes vector search + rule classifier)
+       b. Confidence ≥ AUTO_FIX_CONFIDENCE (0.90)  → Auto-fix + deploy iFlow
+       c. Confidence ≥ SUGGEST_FIX_CONFIDENCE (0.70) → Create PENDING_APPROVAL incident
+       d. Confidence < 0.70                          → Create escalation ticket in HANA
+  4. Persist all incidents and fix outcomes to HANA
+```
+
+#### How to operate
+
+**Start the loop:**
+```bash
+curl -X POST http://localhost:8080/autonomous/start
+```
+
+**Stop the loop:**
+```bash
+curl -X POST http://localhost:8080/autonomous/stop
+```
+
+**Check if it's running:**
+```bash
+curl http://localhost:8080/autonomous/status
+```
+
+**Approve a pending fix (when confidence was 0.70–0.89):**
+```bash
+curl -X POST http://localhost:8080/autonomous/incidents/{id}/approve \
+  -H "Content-Type: application/json" \
+  -d '{"approved": true, "user_id": "user@example.com"}'
+```
+
+**Manually trigger one-shot polling (without starting the loop):**
+```bash
+curl -X POST http://localhost:8080/autonomous/manual_trigger
+```
+
+**Key `.env` controls:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `AUTONOMOUS_ENABLED` | `false` | Start loop automatically on server boot |
+| `POLL_INTERVAL_SECONDS` | `60` | How often to poll SAP CPI for errors |
+| `AUTO_FIX_CONFIDENCE` | `0.90` | Minimum confidence to auto-fix without approval |
+| `SUGGEST_FIX_CONFIDENCE` | `0.70` | Minimum confidence to suggest fix (pending approval) |
+| `MAX_CONSECUTIVE_FAILURES` | `5` | Stop loop after this many consecutive poll errors |
+
+---
+
+#### API Reference
+
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/autonomous/start` | Start autonomous monitoring loop |
@@ -598,19 +720,46 @@ On success the incident status transitions to `ROLLED_BACK`. Fails with `400` if
 
 ## HANA Knowledge Base
 
-The system queries `CPI_KNOWLEDGE_BASE` in HANA Cloud to retrieve relevant fix guidance during RCA. Retrieved entries are injected into the LLM prompt as context, improving the quality and specificity of generated fixes.
+The system queries `SAP_HELP_DOCS` in HANA Cloud to retrieve relevant SAP notes during RCA. Entries are injected into the LLM prompt as context, improving the quality and specificity of generated fixes.
 
-**Table schema:**
+### Building the Knowledge Base
+
+**Step 1 — Scrape SAP Notes** (`scrape_sap_docs.py`):
+
+Uses Playwright (headless Chromium) to authenticate against me.sap.com via SAML2/XSUAA and scrape SAP Note content. Writes directly to HANA per note (crash-safe — re-runnable).
+
+```bash
+# Scrape a file of 500 note URLs
+uv run scrape_sap_docs.py --notes-only --notes-file sap_notes_1.txt
+
+# Options
+--dry-run          # preview only, no writes
+--clear            # drop and recreate SAP_HELP_DOCS before run
+--notes-only       # skip all other phases, SAP notes only
+```
+
+**Step 2 — Vectorize** (`vectorize_docs.py`):
+
+Generates 3072-dim embeddings via SAP AI Core (`text-embedding-3-large`) and stores them in the `VEC_VECTOR` column. Skips already-vectorized rows — safe to re-run after interruption.
+
+```bash
+uv run vectorize_docs.py              # vectorize all un-embedded rows
+uv run vectorize_docs.py --batch 100  # override batch size
+uv run vectorize_docs.py --dry-run    # show counts only
+```
+
+**Table schema (`SAP_HELP_DOCS`):**
 
 | Column | Type | Description |
 |---|---|---|
-| `VEC_TEXT` | NCLOB | Full knowledge base entry text |
-| `VEC_META` | NCLOB | JSON metadata — title, error_category, solution_steps, source |
-| `VEC_VECTOR` | REAL_VECTOR(0) | Pre-computed embedding for semantic search |
+| `ID` | INTEGER | Auto-increment primary key |
+| `VEC_TEXT` | NCLOB | Chunked SAP Note text (max 2000 chars/chunk) |
+| `VEC_META` | NCLOB | JSON metadata — title, url, source, note_id |
+| `VEC_VECTOR` | REAL_VECTOR(3072) | `text-embedding-3-large` embedding |
 
 **Search strategy** (in order of preference):
-1. `CONTAINS(VEC_TEXT, keyword, FUZZY(0.6))` — HANA full-text fuzzy search
-2. `VEC_TEXT LIKE '%error_type%'` — keyword fallback
+1. `COSINE_SIMILARITY(VEC_VECTOR, TO_REAL_VECTOR(?)) DESC` — semantic vector search
+2. `CONTAINS(VEC_TEXT, keyword, FUZZY(0.6))` — HANA full-text fuzzy fallback
 3. `SELECT TOP N` scan — last resort
 
 ---
@@ -757,13 +906,16 @@ CREATE TABLE sap_is_xsd_files (
 );
 ```
 
-#### `CPI_KNOWLEDGE_BASE`
+#### `SAP_HELP_DOCS`
+
+Populated by `scrape_sap_docs.py` and vectorized by `vectorize_docs.py`. Used for semantic RCA context retrieval.
 
 ```sql
-CREATE TABLE cpi_knowledge_base (
-    VEC_TEXT   NCLOB,
-    VEC_META   NCLOB,            -- JSON: title, error_category, solution_steps, source
-    VEC_VECTOR REAL_VECTOR(0)    -- pre-computed embedding (flexible dimension)
+CREATE TABLE sap_help_docs (
+    ID         INTEGER      PRIMARY KEY,   -- auto-increment
+    VEC_TEXT   NCLOB,                      -- chunked SAP Note text
+    VEC_META   NCLOB,                      -- JSON: title, url, source, note_id
+    VEC_VECTOR REAL_VECTOR(3072)           -- text-embedding-3-large embedding
 );
 ```
 
