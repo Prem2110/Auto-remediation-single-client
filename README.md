@@ -9,6 +9,28 @@ An intelligent, autonomous SAP Cloud Platform Integration (CPI) monitoring and s
 
 ---
 
+## Quick Start
+
+```bash
+# 1. Install dependencies
+uv sync
+
+# 2. Copy and fill environment variables
+cp .env.example .env   # then edit .env with your credentials
+
+# 3. (One-time) Build the SAP Notes knowledge base
+uv run playwright install chromium
+uv run scrape_sap_docs.py --notes-only --notes-file sap_notes_1.txt
+uv run vectorize_docs.py
+
+# 4. Start the server
+uvicorn main:app --host 0.0.0.0 --port 8080 --reload
+```
+
+API docs: `http://localhost:8080/docs`
+
+---
+
 ## Features
 
 ### Core Capabilities
@@ -112,7 +134,7 @@ cd auto-remediation
 
 Using uv (recommended):
 ```bash
-uv add -r requirements.txt
+uv sync
 ```
 
 Or pip:
@@ -238,7 +260,15 @@ Install Playwright browsers (required for scraping):
 uv run playwright install chromium
 ```
 
-Scrape SAP Notes from me.sap.com (split your URL list into files of ~500):
+Scrape SAP Notes from me.sap.com. Each notes file is a plain text file with one SAP Note URL per line:
+
+```
+https://me.sap.com/notes/3355155
+https://me.sap.com/notes/2936945
+https://me.sap.com/notes/3109131
+```
+
+Split your full URL list into files of ~500 (manageable run size), then run each:
 ```bash
 uv run scrape_sap_docs.py --notes-only --notes-file sap_notes_1.txt
 uv run scrape_sap_docs.py --notes-only --notes-file sap_notes_2.txt
@@ -1073,6 +1103,22 @@ curl -X PATCH http://localhost:8080/smart-monitoring/escalations/<ticket_id> \
   -H "Content-Type: application/json" \
   -d '{"status": "RESOLVED", "resolution_notes": "Fixed endpoint URL."}'
 ```
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `HANA connection refused / timeout` | Wrong `HANA_HOST`, `HANA_PORT`, or IP not whitelisted | Verify host/port in `.env`; check HANA Cloud instance allows your IP in the allowed connections list |
+| `SAP login failed` in scraper | Credentials wrong or me.sap.com session expired | Check `SAP_USERNAME` / `SAP_PASSWORD` in `.env`; try logging in manually in a browser first |
+| All scraped notes return "SAP for Me" content | React SPA loaded the loading screen, not the note | Expected — scraper uses `wait_for_function` to detect real content; reduce `SAP_NOTE_CONCURRENCY` if pages time out |
+| `MCP connection timeout` on startup | MCP server URL unreachable | Check `MCP_*_URL` values in `.env`; confirm MCP servers are deployed and running |
+| `LLM deployment not found` | Wrong `LLM_DEPLOYMENT_ID` | Verify deployment ID in SAP AI Core Launchpad and update `.env` |
+| `VEC_VECTOR IS NULL` after vectorize run | Script was interrupted mid-run | Re-run `uv run vectorize_docs.py` — it skips already-vectorized rows automatically |
+| `Could not open SAP_HELP_DOCS` in HANA Explorer | HANA DB Explorer can't render `REAL_VECTOR` columns in the UI | Use SQL query instead: `SELECT COUNT(*), SUM(CASE WHEN VEC_VECTOR IS NOT NULL THEN 1 ELSE 0 END) FROM SAP_HELP_DOCS` |
+| `autonomous loop stops after N failures` | `MAX_CONSECUTIVE_FAILURES` threshold hit | Check `logs/mcp.log` for the root cause; fix the underlying SAP API issue then restart the loop |
+| iFlow fix applied but deploy fails with lock error | Another user has the iFlow checked out | Call `POST /smart-monitoring/incidents/{id}/retry_fix` — unlock is attempted automatically on retry |
 
 ---
 
