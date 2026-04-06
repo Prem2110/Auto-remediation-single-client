@@ -1631,6 +1631,47 @@ class MultiMCP:
             ),
         }
 
+    async def _poll_deploy_status(self, iflow_id: str, polls: int = 5, interval: float = 15.0) -> Dict[str, Any]:
+        """
+        After a deploy-iflow timeout, poll IntegrationRuntimeArtifacts directly
+        to check whether SAP CPI completed the deploy independently.
+
+        Returns a result dict:
+          - deploy_confirmed=True  → iFlow is STARTED/DEPLOYED — treat as success
+          - deploy_confirmed=False → still deploying, error, or unreachable
+          - status                 → raw status string from SAP CPI
+        """
+        _STARTED = {"started", "deployed", "active", "running"}
+        _FAILED  = {"error", "failed", "stopped"}
+
+        for attempt in range(1, polls + 1):
+            try:
+                detail = await self.error_fetcher.fetch_runtime_artifact_detail(iflow_id)
+                raw_status = str(
+                    detail.get("Status")
+                    or detail.get("DeployState")
+                    or detail.get("RuntimeStatus")
+                    or ""
+                ).lower().strip()
+
+                logger.info(
+                    "[DEPLOY_POLL] iflow=%s attempt=%d/%d status=%s",
+                    iflow_id, attempt, polls, raw_status,
+                )
+
+                if raw_status in _STARTED:
+                    return {"deploy_confirmed": True, "status": raw_status}
+                if raw_status in _FAILED:
+                    return {"deploy_confirmed": False, "status": raw_status}
+                # Status is STARTING / DEPLOYING / unknown — wait and retry
+            except Exception as exc:
+                logger.warning("[DEPLOY_POLL] iflow=%s attempt=%d error: %s", iflow_id, attempt, exc)
+
+            if attempt < polls:
+                await asyncio.sleep(interval)
+
+        return {"deploy_confirmed": False, "status": "timeout"}
+
     def evaluate_fix_result(self, steps: List[Dict], answer: str) -> Dict[str, Any]:
         update_ok = False
         deploy_ok = False
@@ -2370,6 +2411,37 @@ Execution policy:
                     iflow_id, diagnosis["failed_stage"], diagnosis["fix_applied"],
                     diagnosis["technical_details"][:200],
                 )
+                # Deploy was called but SAP CPI SSE stream dropped — poll directly to
+                # check whether the deploy completed on SAP's side before giving up.
+                if diagnosis["failed_stage"] == "deploy" and iflow_id:
+                    logger.info(
+                        "[FIX_DEPLOY] Deploy timed out — polling SAP CPI runtime status for '%s'", iflow_id
+                    )
+                    poll = await self._poll_deploy_status(iflow_id)
+                    if poll["deploy_confirmed"]:
+                        logger.info(
+                            "[FIX_DEPLOY] Post-timeout poll confirmed iFlow '%s' is %s — marking as success",
+                            iflow_id, poll["status"],
+                        )
+                        return {
+                            **diagnosis,
+                            "success":        True,
+                            "deploy_success": True,
+                            "failed_stage":   None,
+                            "summary": (
+                                f"iFlow '{iflow_id}' updated and deployed successfully. "
+                                f"Deploy confirmation arrived via runtime status poll (SAP CPI status: {poll['status']})."
+                            ),
+                            "technical_details": (
+                                "deploy-iflow SSE stream timed out, but a direct poll of "
+                                f"IntegrationRuntimeArtifacts confirmed status '{poll['status']}'."
+                            ),
+                            "steps": logger_cb.steps,
+                        }
+                    logger.warning(
+                        "[FIX_DEPLOY] Post-timeout poll for '%s' returned status='%s' — deploy not confirmed",
+                        iflow_id, poll["status"],
+                    )
                 return {**diagnosis, "steps": logger_cb.steps}
             except Exception as e:
                 if attempt < 2:
@@ -2442,7 +2514,30 @@ Execution policy:
             and not evaluation.get("deploy_success")
             and evaluation.get("failed_stage") == "deploy"
         ):
-            deploy_errors = await self.get_deploy_error_details(iflow_id)
+            # Before attempting correction: check whether SAP CPI already finished
+            # deploying (deploy-iflow may have returned an unrecognised response format
+            # even though the deploy actually succeeded).
+            _pre_poll = await self._poll_deploy_status(iflow_id, polls=3, interval=10.0)
+            if _pre_poll["deploy_confirmed"]:
+                logger.info(
+                    "[FIX_DEPLOY] Pre-correction poll confirmed '%s' is already %s — skipping correction passes",
+                    iflow_id, _pre_poll["status"],
+                )
+                evaluation["success"]          = True
+                evaluation["deploy_success"]   = True
+                evaluation["failed_stage"]     = None
+                evaluation["summary"]          = (
+                    f"iFlow '{iflow_id}' updated and deployed successfully. "
+                    f"Deployment confirmed via runtime status poll (status: {_pre_poll['status']})."
+                )
+                evaluation["technical_details"] = (
+                    f"deploy-iflow response was unrecognised, but a direct poll of "
+                    f"IntegrationRuntimeArtifacts confirmed status '{_pre_poll['status']}'."
+                )
+                # Skip the correction loop entirely
+                deploy_errors = None
+            else:
+                deploy_errors = await self.get_deploy_error_details(iflow_id)
             if deploy_errors:
                 _MAX_CORRECTION_PASSES = 3
                 for _corr_pass in range(1, _MAX_CORRECTION_PASSES + 1):

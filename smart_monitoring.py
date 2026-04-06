@@ -1498,6 +1498,47 @@ async def retry_fix(
     }
 
 
+@router.post("/incidents/{incident_id}/resolve")
+async def resolve_incident(incident_id: str):
+    """
+    Manually mark an incident as FIX_VERIFIED.
+
+    Use when the fix is confirmed working outside the agent
+    (e.g. deploy timed out but iFlow is actually running fine).
+    Sets status → FIX_VERIFIED, verification_status → MANUALLY_VERIFIED, resolved_at → now.
+    """
+    incident = get_incident_by_id(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    resolvable = {
+        "FIX_FAILED_DEPLOY", "FIX_FAILED_RUNTIME", "FIX_FAILED",
+        "FIX_FAILED_UPDATE", "VERIFICATION_UNAVAILABLE",
+    }
+    current = incident.get("status", "")
+    if current not in resolvable:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot resolve — status is '{current}'. "
+                   f"Only failed/unverified incidents can be manually resolved.",
+        )
+
+    now = get_hana_timestamp()
+    update_incident(incident_id, {
+        "status":               "FIX_VERIFIED",
+        "verification_status":  "MANUALLY_VERIFIED",
+        "resolved_at":          now,
+        "fix_summary":          (incident.get("fix_summary") or "") + " [Manually marked as resolved]",
+    })
+    return {
+        "incident_id":  incident_id,
+        "iflow_id":     incident.get("iflow_id"),
+        "status":       "FIX_VERIFIED",
+        "resolved_at":  now,
+        "message":      "Incident marked as resolved. iFlow is considered working.",
+    }
+
+
 @router.post("/incidents/{incident_id}/rollback")
 async def rollback_fix(
     incident_id: str,

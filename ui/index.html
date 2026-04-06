@@ -462,7 +462,15 @@
           <button class="btn btn-warning btn-sm" onclick="gotoRetryFromStatus()">
             → Retry Fix
           </button>
+          <button class="btn btn-success btn-sm" id="st-resolve-btn"
+            onclick="doResolve()"
+            title="Mark as resolved — use when iFlow is confirmed working but deploy confirmation timed out">
+            ✓ Mark as Resolved
+          </button>
         </div>
+        <p style="font-size:11px;color:var(--muted);margin-top:8px">
+          Use "Mark as Resolved" only when you have verified the iFlow is working correctly in SAP CPI.
+        </p>
       </div>
     </div>
   </div>
@@ -820,6 +828,25 @@ async function doStatus(withPoll) {
     showToast(e.message || 'Request failed', false);
   } finally {
     setSpinner('st-spinner', false);
+  }
+}
+
+async function doResolve() {
+  const id = document.getElementById('st-id').value.trim();
+  if (!id) { showToast('Incident ID is required', false); return; }
+  if (!confirm(`Mark incident ${id.slice(0,8)}… as manually resolved?\n\nOnly do this if you have confirmed the iFlow is working in SAP CPI.`)) return;
+
+  const btn = document.getElementById('st-resolve-btn');
+  btn.disabled = true;
+  try {
+    const d = await apiFetch('POST', `/smart-monitoring/incidents/${encodeURIComponent(id)}/resolve`);
+    showToast('Incident marked as resolved');
+    // Refresh status display
+    await doStatus(false);
+  } catch (e) {
+    showToast(e.message || 'Could not resolve', false);
+  } finally {
+    btn.disabled = false;
   }
 }
 
