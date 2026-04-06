@@ -713,7 +713,13 @@ def get_recent_incident_by_group_key(group_key: str, within_seconds: int = 60) -
 
 
 def get_similar_patterns(error_signature: str) -> List[Dict]:
-    """Return successful patterns ranked by success rate then applied_count."""
+    """Return successful patterns ranked by success rate, then recency, then applied_count.
+
+    Ranking priority:
+      1. success_rate  (success_count / applied_count) — most reliable fix first
+      2. last_seen     (DESC) — favour recent patterns over stale ones
+      3. applied_count (DESC) — tie-break by usage frequency
+    """
     try:
         conn = get_connection()
         cur  = conn.cursor()
@@ -723,6 +729,7 @@ def get_similar_patterns(error_signature: str) -> List[Dict]:
                ORDER BY
                  CAST(COALESCE("success_count", 0) AS REAL) /
                    NULLIF(applied_count, 0) DESC,
+                 last_seen DESC,
                  applied_count DESC
                LIMIT 5""",
             (error_signature,),

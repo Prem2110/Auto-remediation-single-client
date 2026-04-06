@@ -136,13 +136,51 @@ TICKET_DEFAULT_ASSIGNEE = os.getenv("TICKET_DEFAULT_ASSIGNEE", "")
 BURST_DEDUP_WINDOW_SECONDS = int(os.getenv("BURST_DEDUP_WINDOW_SECONDS", "60"))
 
 REMEDIATION_POLICIES = {
-    "MAPPING_ERROR":     {"action": "AUTO_FIX", "replay_after_fix": True},
-    "DATA_VALIDATION":   {"action": "AUTO_FIX", "replay_after_fix": True},
-    "AUTH_ERROR":        {"action": "AUTO_FIX", "replay_after_fix": True},
-    "CONNECTIVITY_ERROR":{"action": "RETRY",    "replay_after_fix": True},
-    "BACKEND_ERROR":     {"action": "AUTO_FIX", "replay_after_fix": True},
-    "UNKNOWN_ERROR":     {"action": "APPROVAL", "replay_after_fix": False},
+    "MAPPING_ERROR":     {"action": "AUTO_FIX",        "replay_after_fix": True},
+    "DATA_VALIDATION":   {"action": "AUTO_FIX",        "replay_after_fix": True},
+    "AUTH_ERROR":        {"action": "AUTO_FIX",        "replay_after_fix": True},
+    "CONNECTIVITY_ERROR":    {"action": "RETRY",           "replay_after_fix": True},
+    # 4xx — iFlow sent a bad request; the adapter config (URL, path, method) is wrong
+    "ADAPTER_CONFIG_ERROR":  {"action": "AUTO_FIX",        "replay_after_fix": True},
+    # 5xx — backend service is failing; nothing in the iFlow can fix a server fault
+    "BACKEND_ERROR":         {"action": "TICKET_CREATED",  "replay_after_fix": False},
+    # SFTP errors (missing directory, permission denied) require human action on the
+    # remote server — the agent cannot create directories or fix server-side paths.
+    "SFTP_ERROR":        {"action": "TICKET_CREATED",  "replay_after_fix": False},
+    "UNKNOWN_ERROR":     {"action": "APPROVAL",        "replay_after_fix": False},
 }
+
+# One-liner shown in the API response so callers know exactly what to do next.
+# Keyed by error_type first; status overrides are applied at response-build time.
+ACTION_HINTS: Dict[str, str] = {
+    "MAPPING_ERROR":        "Agent is auto-fixing the message mapping — redeploy will follow automatically.",
+    "DATA_VALIDATION":      "Agent is auto-fixing payload validation — redeploy will follow automatically.",
+    "AUTH_ERROR":           "Agent is auto-fixing the credential/certificate configuration — redeploy will follow automatically.",
+    "CONNECTIVITY_ERROR":   "Transient network issue — the agent will retry the iFlow automatically.",
+    "ADAPTER_CONFIG_ERROR": "iFlow receiver adapter is misconfigured (HTTP 4xx) — agent is fixing the endpoint URL, method, or headers.",
+    "BACKEND_ERROR":        "Backend service returned HTTP 5xx — the iFlow is working correctly. Backend team must investigate and restore the service.",
+    "SFTP_ERROR":           "SFTP server-side issue — verify the target directory exists and the SFTP user has write/read access. Re-trigger the iFlow once resolved.",
+    "UNKNOWN_ERROR":        "Error could not be classified automatically — awaiting human review before any fix is applied.",
+}
+
+# Status-level overrides — shown when the incident has already been routed.
+_STATUS_ACTION_HINTS: Dict[str, str] = {
+    "TICKET_CREATED":             "A support ticket has been created — waiting for the responsible team to resolve the underlying issue.",
+    "AWAITING_APPROVAL":          "Fix is ready but requires human approval before it is applied.",
+    "FIX_IN_PROGRESS":            "Agent is currently applying the fix — check back shortly.",
+    "FIX_VERIFIED":               "Fix was applied and verified successfully — no further action needed.",
+    "HUMAN_INITIATED_FIX":        "Fix was applied manually — no further action needed.",
+    "RETRIED":                    "iFlow was retried automatically — monitor the next execution.",
+    "FIX_FAILED":                 "Automatic fix failed — review the fix log and apply the suggested change manually.",
+    "FIX_FAILED_UPDATE":          "Fix could not be uploaded to SAP CPI — check artifact permissions and retry.",
+    "FIX_FAILED_DEPLOY":          "Fix was uploaded but deployment failed — check CPI deploy logs and retry deploy.",
+    "FIX_FAILED_RUNTIME":         "iFlow deployed but failed again at runtime — a deeper manual investigation is needed.",
+    "ARTIFACT_MISSING":           "iFlow artifact could not be found in SAP CPI — verify the iFlow ID and package.",
+    "REJECTED":                   "Fix was rejected by the approver — re-open and submit a revised fix if needed.",
+    "RCA_INCONCLUSIVE":           "Root cause could not be determined — additional logs or manual analysis required.",
+    "VERIFICATION_UNAVAILABLE":   "Fix deployed but verification test could not run — manually verify the iFlow in CPI.",
+}
+
 
 TRANSIENT_ERROR_MARKERS = (
     "429", "503", "service unavailable", "too many requests",
@@ -170,13 +208,26 @@ FALLBACK_FIX_BY_ERROR_TYPE: Dict[str, str] = {
         "Verify the credential alias, OAuth configuration, certificates, and security material used by the receiver "
         "adapter. Refresh expired credentials or certificates, update the adapter config, and redeploy."
     ),
+    "ADAPTER_CONFIG_ERROR": (
+        "The iFlow is sending a malformed or incorrect request (HTTP 4xx). "
+        "Fix the receiver adapter: check the endpoint URL path, HTTP method, Content-Type header, "
+        "and request payload structure. Correct the adapter config and redeploy."
+    ),
     "BACKEND_ERROR": (
-        "Check the receiver endpoint configuration, adapter parameters, retry policy, and backend connectivity. "
-        "If the error is caused by iFlow-side config, correct the receiver adapter settings and redeploy."
+        "The backend service returned a server-side fault (HTTP 5xx). "
+        "This cannot be fixed by changing the iFlow — the backend team must investigate and restore the service. "
+        "A support ticket has been created."
     ),
     "CONNECTIVITY_ERROR": (
         "Verify destination, host, port, firewall, proxy, and adapter connectivity settings. Add or adjust retries "
         "only if the receiver adapter configuration is incomplete, then redeploy."
+    ),
+    "SFTP_ERROR": (
+        "SFTP errors (missing directory, permission denied) cannot be fixed by changing the iFlow configuration. "
+        "Required actions: (1) verify the directory path exists on the SFTP server, "
+        "(2) create any missing directories on the SFTP server, "
+        "(3) confirm the SFTP user has write permission to the target path. "
+        "Once the server-side issue is resolved, re-trigger the iFlow manually."
     ),
     "UNKNOWN_ERROR": (
         "Inspect the message processing log, identify the failing iFlow component, correct the relevant step "
@@ -406,14 +457,14 @@ ERROR_TYPE_FIX_GUIDANCE: Dict[str, str] = {
         "- Increase connection timeout or retry count ONLY if the current config is insufficient.\n"
         "- Do NOT modify business logic or message mappings for connectivity errors."
     ),
-    "BACKEND_ERROR": (
-        "=== BACKEND_ERROR GUIDANCE ===\n"
-        "- Inspect the receiver adapter endpoint URL and adapter parameters.\n"
-        "- Check if the backend returned a specific error code (400/500) and address it in config.\n"
-        "- Adjust retry policy, timeout, or endpoint path in the adapter.\n"
+    "ADAPTER_CONFIG_ERROR": (
+        "=== ADAPTER_CONFIG_ERROR GUIDANCE ===\n"
+        "- The backend returned HTTP 4xx — the iFlow is sending an incorrect request.\n"
+        "- Inspect the receiver adapter: endpoint URL path, HTTP method, Content-Type, Accept headers.\n"
+        "- Check if the API version in the URL is outdated or if a required query parameter is missing.\n"
         "- Do NOT modify sender-side mappings unless the payload format is the root cause.\n"
         "- CRITICAL — CONFIG-ONLY FIX: Apply ONLY property/configuration changes to EXISTING components "
-        "(receiver URL, Accept header, timeout, retry count, credential alias). "
+        "(receiver URL, HTTP method, Accept header, credential alias). "
         "Do NOT add new structural components (Content-Based Router, Exception Subprocess, "
         "JSON/XML Converter, new adapter). "
         "The proposed_fix may describe structural changes as conceptual guidance — "
@@ -654,6 +705,8 @@ def _extract_iflow_file(snapshot_str: str) -> tuple[str, str]:
 
 def _check_iflow_xml(original_xml: str, modified_xml: str) -> list[str]:
     """Structural checks on the modified iFlow XML. Returns list of error strings."""
+    import re as _re
+
     errors: list[str] = []
     try:
         mod_root = ET.fromstring(modified_xml)
@@ -699,6 +752,123 @@ def _check_iflow_xml(original_xml: str, modified_xml: str) -> list[str]:
                         )
         except ET.ParseError:
             pass  # original XML unreadable — skip version check
+
+    # Check 3 — platform version caps on NEW elements (not in original)
+    # Catches LLM adding a new component with a version above the IFLMAP profile limit.
+    _VERSION_CAPS: Dict[str, tuple[str, float]] = {
+        "EndEvent":           ("EndEvent", 1.0),
+        "ExceptionSubProcess": ("ExceptionSubProcess", 1.1),
+        "com.sap.soa.proxy.ws": ("SOAP adapter", 1.11),
+        "SOAP":               ("SOAP adapter", 1.11),
+    }
+    orig_ids: set = set()
+    if original_xml:
+        try:
+            orig_root2 = ET.fromstring(original_xml)
+            orig_ids = {el.get("id") for el in orig_root2.iter() if el.get("id")}
+        except ET.ParseError:
+            pass
+    for el in mod_root.iter():
+        el_id  = el.get("id", "")
+        el_ver = el.get("version", "")
+        el_tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+        if el_id and el_id not in orig_ids and el_ver:
+            # New element — check version cap
+            for cap_key, (cap_label, cap_max) in _VERSION_CAPS.items():
+                if cap_key in el_tag or cap_key in (el.get("name") or ""):
+                    try:
+                        if float(el_ver) > cap_max:
+                            errors.append(
+                                f"New element '{el_id}' has version '{el_ver}' which exceeds "
+                                f"the IFLMAP platform maximum for {cap_label} ({cap_max}). "
+                                f"Set version='{cap_max}' or lower."
+                            )
+                    except ValueError:
+                        pass
+
+    # Check 4 — XPath expressions that use a namespace prefix must include declare namespace
+    # Looks for ifl:property values that look like XPath (contain '//' or 'xpath' in key)
+    # but use a 'prefix:element' pattern without a 'declare namespace' directive.
+    for el in mod_root.iter():
+        key_el = el.find(f"{{{_IFL}}}key") or el.find("key")
+        val_el = el.find(f"{{{_IFL}}}value") or el.find("value")
+        if key_el is None or val_el is None:
+            continue
+        key = (key_el.text or "").lower()
+        val = (val_el.text or "")
+        if "xpath" in key or val.strip().startswith("//") or "//" in val:
+            # Check for namespace prefix usage: word:word pattern (excluding http://)
+            ns_uses = _re.findall(r'\b([a-zA-Z][a-zA-Z0-9_]*):[a-zA-Z]', val)
+            ns_uses = [p for p in ns_uses if p.lower() not in ("http", "https", "urn", "xmlns")]
+            if ns_uses:
+                declared = _re.findall(r'declare\s+namespace\s+([a-zA-Z][a-zA-Z0-9_]*)\s*=', val)
+                missing = [p for p in ns_uses if p not in declared]
+                if missing:
+                    errors.append(
+                        f"XPath expression in property '{key_el.text}' uses namespace prefix(es) "
+                        f"{missing} but no 'declare namespace' directive found. "
+                        f"Add inline declarations before the path, e.g.: "
+                        f"declare namespace {missing[0]}='http://...'; //{missing[0]}:element"
+                    )
+
+    # Check 5 — Content Modifier header rows must use srcType="Expression", never "Constant"
+    # Header rows are identified by a 'headerName' sibling property inside the same parent element.
+    for task in mod_root.iter(f"{{{_BPMN2}}}serviceTask"):
+        ext = task.find(f"{{{_BPMN2}}}extensionElements")
+        if ext is None:
+            continue
+        props = ext.findall(f"{{{_IFL}}}property")
+        # Build a dict of key→value for the properties in this step
+        kv: Dict[str, str] = {}
+        for p in props:
+            k = p.findtext(f"{{{_IFL}}}key") or p.findtext("key") or ""
+            v = p.findtext(f"{{{_IFL}}}value") or p.findtext("value") or ""
+            kv[k] = v
+        # If this step has a headerName property (Content Modifier header row)
+        # and srcType is set to "Constant", that is invalid
+        if "headerName" in kv and kv.get("srcType", "") == "Constant":
+            errors.append(
+                f"Content Modifier step '{task.get('id', '?')}' has a header row with "
+                f"srcType='Constant'. Header rows MUST use srcType='Expression'. "
+                f"Change srcType value to 'Expression'."
+            )
+
+    # Check 6 — every exclusiveGateway (Content-Based Router) must have a default route
+    # A default route is a sequenceFlow with isDefault="true" sourced from the gateway,
+    # or a condition expression that always evaluates to true.
+    for gw in mod_root.iter(f"{{{_BPMN2}}}exclusiveGateway"):
+        gw_id = gw.get("id", "")
+        # Collect outgoing sequence flow IDs
+        outgoing_ids = {sf.text.strip() for sf in gw.findall(f"{{{_BPMN2}}}outgoing") if sf.text}
+        if not outgoing_ids:
+            continue  # no outgoing flows yet — don't flag incomplete edits
+        has_default = False
+        for sf in mod_root.iter(f"{{{_BPMN2}}}sequenceFlow"):
+            if sf.get("sourceRef") == gw_id and sf.get("isDefault", "").lower() == "true":
+                has_default = True
+                break
+        if not has_default and len(outgoing_ids) > 1:
+            errors.append(
+                f"Content-Based Router (exclusiveGateway) '{gw_id}' has no default route. "
+                f"Every router MUST have a default outgoing sequenceFlow with isDefault='true'. "
+                f"Add a default route to prevent deployment failure."
+            )
+
+    # Check 7 — Groovy script step references must use /script/<Name>.groovy format,
+    # not the full archive path src/main/resources/script/...
+    for el in mod_root.iter():
+        key_el = el.find(f"{{{_IFL}}}key") or el.find("key")
+        val_el = el.find(f"{{{_IFL}}}value") or el.find("value")
+        if key_el is None or val_el is None:
+            continue
+        key = (key_el.text or "").lower()
+        val = (val_el.text or "")
+        if "script" in key and "src/main/resources" in val:
+            errors.append(
+                f"Groovy script reference '{val}' uses the full archive path. "
+                f"The model reference must be '/script/<FileName>.groovy' "
+                f"(not 'src/main/resources/script/...'). Fix the value."
+            )
 
     return errors
 
@@ -2263,9 +2433,9 @@ Execution policy:
                 )
                 evaluation["technical_details"] = locked_msg
 
-        # ── Deploy-error self-correction pass (one attempt) ──────────────────
+        # ── Deploy-error self-correction passes (up to 3 attempts) ─────────────
         # If update succeeded but deploy failed, fetch the exact validation errors
-        # and give the agent one more targeted pass to correct only those issues.
+        # and give the agent up to 3 targeted correction passes to resolve them.
         if (
             iflow_id
             and evaluation.get("fix_applied")
@@ -2274,61 +2444,76 @@ Execution policy:
         ):
             deploy_errors = await self.get_deploy_error_details(iflow_id)
             if deploy_errors:
-                logger.info(
-                    f"[FIX_DEPLOY] Deploy validation errors for '{iflow_id}' — "
-                    f"attempting self-correction pass. Errors: {deploy_errors[:300]}"
-                )
-                correction_prompt = (
-                    f"DEPLOY CORRECTION — the previous fix for iFlow '{iflow_id}' was uploaded "
-                    f"but deployment failed with these validation errors:\n\n"
-                    f"{deploy_errors[:2000]}\n\n"
-                    f"INSTRUCTIONS — execute in order, no skipping:\n"
-                    f"1. Call get-iflow with ID '{iflow_id}' to download the current (already-updated) iFlow.\n"
-                    f"2. Read each validation error carefully and reason about what XML change caused it. "
-                    f"Fix ONLY those errors in the iFlow XML. Preserve all other content unchanged.\n"
-                    f"   - Do not guess — derive the fix directly from the error message and the XML you see.\n"
-                    f"   - Do not add new components. Correct or remove only what the error points to.\n"
-                    f"3. Call update-iflow with the corrected iFlow.\n"
-                    f"4. Call deploy-iflow with iFlow ID '{iflow_id}'.\n\n"
-                    f"Return EXACTLY this JSON (no markdown):\n"
-                    f'{{"fix_applied": true, "deploy_success": true/false, '
-                    f'"summary": "<what was corrected and deploy outcome>"}}'
-                )
-                tracker_corr = TestExecutionTracker(user_id, f"fix_correction:{iflow_id}", timestamp)
-                logger_cb_corr = StepLogger(tracker_corr, progress_fn=progress_fn)
-                try:
-                    result_corr = await asyncio.wait_for(
-                        self.agent.ainvoke(
-                            {"messages": [{"role": "user", "content": correction_prompt}]},
-                            config={"callbacks": [logger_cb_corr], "recursion_limit": 12},
-                        ),
-                        timeout=480.0,
+                _MAX_CORRECTION_PASSES = 3
+                for _corr_pass in range(1, _MAX_CORRECTION_PASSES + 1):
+                    logger.info(
+                        "[FIX_DEPLOY] Deploy validation errors for '%s' — "
+                        "self-correction pass %d/%d. Errors: %s",
+                        iflow_id, _corr_pass, _MAX_CORRECTION_PASSES, deploy_errors[:300],
                     )
-                    final_msg_corr = result_corr["messages"][-1]
-                    answer_corr = (
-                        final_msg_corr.content
-                        if hasattr(final_msg_corr, "content")
-                        else str(final_msg_corr)
+                    correction_prompt = (
+                        f"DEPLOY CORRECTION (pass {_corr_pass}/{_MAX_CORRECTION_PASSES}) — "
+                        f"the previous fix for iFlow '{iflow_id}' was uploaded "
+                        f"but deployment failed with these validation errors:\n\n"
+                        f"{deploy_errors[:2000]}\n\n"
+                        f"INSTRUCTIONS — execute in order, no skipping:\n"
+                        f"1. Call get-iflow with ID '{iflow_id}' to download the current (already-updated) iFlow.\n"
+                        f"2. Read each validation error carefully and reason about what XML change caused it. "
+                        f"Fix ONLY those errors in the iFlow XML. Preserve all other content unchanged.\n"
+                        f"   - Do not guess — derive the fix directly from the error message and the XML you see.\n"
+                        f"   - Do not add new components. Correct or remove only what the error points to.\n"
+                        f"3. Call update-iflow with the corrected iFlow.\n"
+                        f"4. Call deploy-iflow with iFlow ID '{iflow_id}'.\n\n"
+                        f"Return EXACTLY this JSON (no markdown):\n"
+                        f'{{"fix_applied": true, "deploy_success": true/false, '
+                        f'"summary": "<what was corrected and deploy outcome>"}}'
                     )
-                    eval_corr = self.evaluate_fix_result(logger_cb_corr.steps, answer_corr)
-                    if eval_corr.get("deploy_success"):
-                        logger.info(
-                            f"[FIX_DEPLOY] Self-correction pass succeeded for '{iflow_id}'"
+                    tracker_corr = TestExecutionTracker(user_id, f"fix_correction_p{_corr_pass}:{iflow_id}", timestamp)
+                    logger_cb_corr = StepLogger(tracker_corr, progress_fn=progress_fn)
+                    try:
+                        result_corr = await asyncio.wait_for(
+                            self.agent.ainvoke(
+                                {"messages": [{"role": "user", "content": correction_prompt}]},
+                                config={"callbacks": [logger_cb_corr], "recursion_limit": 12},
+                            ),
+                            timeout=480.0,
                         )
-                        evaluation = eval_corr
-                        logger_cb = logger_cb_corr
-                        answer = answer_corr
-                    else:
-                        logger.warning(
-                            f"[FIX_DEPLOY] Self-correction pass did not resolve deploy errors for '{iflow_id}'"
+                        final_msg_corr = result_corr["messages"][-1]
+                        answer_corr = (
+                            final_msg_corr.content
+                            if hasattr(final_msg_corr, "content")
+                            else str(final_msg_corr)
                         )
-                        evaluation["failed_stage"] = "deploy_validation"
-                        evaluation["technical_details"] = (
-                            f"Original deploy errors: {deploy_errors[:600]}\n"
-                            f"Correction pass result: {eval_corr.get('technical_details', '')}"
+                        eval_corr = self.evaluate_fix_result(logger_cb_corr.steps, answer_corr)
+                        if eval_corr.get("deploy_success"):
+                            logger.info(
+                                "[FIX_DEPLOY] Self-correction pass %d succeeded for '%s'",
+                                _corr_pass, iflow_id,
+                            )
+                            evaluation = eval_corr
+                            logger_cb  = logger_cb_corr
+                            answer     = answer_corr
+                            break  # deploy succeeded — stop correction loop
+                        else:
+                            logger.warning(
+                                "[FIX_DEPLOY] Self-correction pass %d did not resolve deploy errors for '%s'",
+                                _corr_pass, iflow_id,
+                            )
+                            evaluation["failed_stage"] = "deploy_validation"
+                            evaluation["technical_details"] = (
+                                f"Original deploy errors: {deploy_errors[:600]}\n"
+                                f"Correction pass {_corr_pass} result: {eval_corr.get('technical_details', '')}"
+                            )
+                            # Re-fetch errors for the next pass in case they changed
+                            new_errors = await self.get_deploy_error_details(iflow_id)
+                            if new_errors:
+                                deploy_errors = new_errors
+                    except Exception as corr_exc:
+                        logger.error(
+                            "[FIX_DEPLOY] Self-correction pass %d error for '%s': %s",
+                            _corr_pass, iflow_id, corr_exc,
                         )
-                except Exception as corr_exc:
-                    logger.error(f"[FIX_DEPLOY] Self-correction pass error for '{iflow_id}': {corr_exc}")
+                        break  # don't retry on unexpected exception
 
         self.update_memory(session_id, f"Fix {iflow_id}", evaluation["summary"])
 
@@ -2351,16 +2536,33 @@ Execution policy:
         if any(k in msg for k in ["mappingexception", "does not exist in target",
                                    "target structure", "mapping runtime"]):
             return {"error_type": "MAPPING_ERROR",      "confidence": 0.88, "tags": ["mapping","schema"]}
+        # SFTP errors — requires server-side action, not iFlow config change.
+        # Auth failures on SFTP are also server/credential issues — caught here before AUTH_ERROR.
+        if any(k in msg for k in ["no such file", "no such directory", "sftp",
+                                   "permission denied", "sshexception", "jsch",
+                                   "failed to connect sftp", "cannot open channel",
+                                   "auth fail", "authentication failed", "publickey",
+                                   "hostkey", "known hosts", "host key",
+                                   "file already exists", "quota exceeded", "no space left"]):
+            return {"error_type": "SFTP_ERROR",         "confidence": 0.93, "tags": ["sftp","filesystem"]}
         if any(k in msg for k in ["connection refused", "connect timed out",
                                    "unreachable", "socketexception"]):
             return {"error_type": "CONNECTIVITY_ERROR", "confidence": 0.90, "tags": ["network","timeout"]}
         if any(k in msg for k in ["401","403","unauthorized","expired",
                                    "certificate","ssl","tls"]):
             return {"error_type": "AUTH_ERROR",         "confidence": 0.92, "tags": ["auth","cert"]}
-        if any(k in msg for k in ["503", "service unavailable"]):
-            return {"error_type": "BACKEND_ERROR",      "confidence": 0.85, "tags": ["backend","503"]}
-        if any(k in msg for k in ["500","429","internal server error","backend"]):
-            return {"error_type": "BACKEND_ERROR",      "confidence": 0.80, "tags": ["backend"]}
+        # 5xx — backend is at fault; iFlow cannot fix a server-side error
+        if any(k in msg for k in ["503", "service unavailable", "502", "bad gateway"]):
+            return {"error_type": "BACKEND_ERROR",         "confidence": 0.85, "tags": ["backend","5xx"]}
+        if any(k in msg for k in ["500", "internal server error", "backend"]):
+            return {"error_type": "BACKEND_ERROR",         "confidence": 0.82, "tags": ["backend","500"]}
+        # 4xx — iFlow sent a bad request; fix the adapter config
+        if any(k in msg for k in ["400", "bad request", "404", "not found",
+                                   "422", "unprocessable", "405", "method not allowed"]):
+            return {"error_type": "ADAPTER_CONFIG_ERROR",  "confidence": 0.82, "tags": ["adapter","4xx"]}
+        # 429 — rate limiting is transient; retry
+        if any(k in msg for k in ["429", "too many requests", "rate limit", "rate limited"]):
+            return {"error_type": "CONNECTIVITY_ERROR",    "confidence": 0.80, "tags": ["network","ratelimit"]}
         if any(k in msg for k in ["field", "mapping"]):
             return {"error_type": "MAPPING_ERROR",      "confidence": 0.75, "tags": ["mapping","schema"]}
         return {"error_type": "UNKNOWN_ERROR",          "confidence": 0.50, "tags": []}
@@ -2377,10 +2579,27 @@ Execution policy:
             return f"Payload validation failed because required or type-safe input data is missing or invalid. Error: {error_message}"
         if error_type == "AUTH_ERROR":
             return f"Authentication or certificate configuration is invalid or expired for the target connection. Error: {error_message}"
+        if error_type == "ADAPTER_CONFIG_ERROR":
+            return f"The iFlow sent an incorrect request to the backend (HTTP 4xx) — the receiver adapter URL path, HTTP method, or request format does not match what the backend expects. Error: {error_message}"
         if error_type == "BACKEND_ERROR":
-            return f"Receiver/backend processing failed or adapter configuration is not aligned with the target system. Error: {error_message}"
+            return f"The backend service returned a server-side fault (HTTP 5xx). The iFlow is working correctly — the backend must be investigated and restored by the responsible team. Error: {error_message}"
         if error_type == "CONNECTIVITY_ERROR":
             return f"Network or destination connectivity to the receiver system failed. Error: {error_message}"
+        if error_type == "SFTP_ERROR":
+            msg = error_message.lower()
+            if any(k in msg for k in ["auth fail", "authentication failed", "publickey"]):
+                detail = "SFTP authentication failed — the credential alias, SSH key, or password configured in the receiver adapter is incorrect or expired."
+            elif any(k in msg for k in ["hostkey", "known hosts", "host key"]):
+                detail = "SFTP host key verification failed — the server fingerprint changed or is not trusted. Update the known hosts configuration."
+            elif any(k in msg for k in ["permission denied"]):
+                detail = "SFTP permission denied — the SFTP user does not have write access to the target directory."
+            elif any(k in msg for k in ["file already exists"]):
+                detail = "SFTP file already exists on the server — enable overwrite in the adapter or clean up the existing file."
+            elif any(k in msg for k in ["quota", "no space left"]):
+                detail = "SFTP server disk quota exceeded — free up space on the target server."
+            else:
+                detail = "SFTP operation failed — the remote directory does not exist or the SFTP user lacks permission."
+            return f"{detail} This requires manual action on the SFTP server or credential store. Error: {error_message}"
         return f"Unable to fully classify the CPI failure. Use logs and the failing iFlow step to identify the required configuration change. Error: {error_message}"
 
     async def run_rca(self, incident: Dict) -> Dict:
@@ -2976,6 +3195,10 @@ Do NOT call get-iflow. Do NOT modify the iFlow. Do NOT call deploy. Do NOT fetch
                 "suggested_fix": incident.get("proposed_fix"),
                 "confidence": incident.get("rca_confidence"),
                 "affected_component": incident.get("affected_component"),
+                "recommended_action": (
+                    _STATUS_ACTION_HINTS.get(incident.get("status", ""))
+                    or ACTION_HINTS.get(incident.get("error_type", ""), "No action hint available.")
+                ),
                 "can_generate_fix": incident.get("status") in {
                     "RCA_COMPLETE", "AWAITING_APPROVAL",
                     "FIX_FAILED", "FIX_FAILED_UPDATE", "FIX_FAILED_DEPLOY", "FIX_FAILED_RUNTIME",
@@ -3118,9 +3341,78 @@ Do NOT call get-iflow. Do NOT modify the iFlow. Do NOT call deploy. Do NOT fetch
                 "affected_component": rca.get("affected_component", ""),
             })
 
+        # ── Unfixable detection — route to TICKET_CREATED before wasting a fix attempt ──
+        # Some errors are structurally unfixable by XML property edits:
+        #   • Groovy script logic needs rewriting (try/catch, JsonSlurper, etc.)
+        #   • Structural additions needed (add Router, add Subprocess, etc.)
+        #   • Bad runtime data from upstream (empty payload, non-JSON, wrong Content-Type)
+        # In all these cases the proposed_fix will contain specific language that signals
+        # the fix is beyond what the agent can safely do. Detect and ticket early.
+        _unfixable_signals = [
+            # Groovy script rewrites
+            "jsonslurper", "try/catch", "try {", "groovy script", "switch to",
+            "rewrite the script", "modify the script", "update the script",
+            # Structural changes
+            "add a router", "add router", "add content-based router",
+            "add an exception subprocess", "add exception subprocess",
+            "add a subprocess", "add new step", "add a new step",
+            "add a converter", "add json-to-xml", "add xml-to-json",
+            # Runtime data problems (upstream issue — not iFlow config)
+            "upstream", "payload is not valid json", "empty payload",
+            "payload is empty", "non-json payload", "invalid json payload",
+            "content-type mismatch", "backend returns", "backend response",
+        ]
+        _fix_hint = (rca.get("proposed_fix") or "").lower()
+        _root_cause_hint = (rca.get("root_cause") or "").lower()
+        _unfixable_match = next(
+            (s for s in _unfixable_signals if s in _fix_hint or s in _root_cause_hint),
+            None,
+        )
+        if _unfixable_match and not deploy_only:
+            logger.warning(
+                "[FIX] Unfixable signal detected in proposed_fix/root_cause — "
+                "routing to TICKET_CREATED without attempting XML edit. "
+                "Signal: '%s' | iflow=%s", _unfixable_match, iflow_id,
+            )
+            _unfixable_reason = (
+                f"Auto-fix skipped: the root cause requires changes that cannot be safely applied "
+                f"by editing iFlow XML properties (detected: '{_unfixable_match}'). "
+                f"Manual intervention is required.\n\n"
+                f"Root cause: {rca.get('root_cause', '')}\n"
+                f"Suggested fix: {rca.get('proposed_fix', '')}"
+            )
+            ticket_id = await self._create_external_ticket(
+                {**working_incident, "fix_summary": _unfixable_reason},
+                rca,
+            )
+            update_incident(incident_id, {
+                "status":     "TICKET_CREATED",
+                "fix_summary": _unfixable_reason,
+                "ticket_id":  ticket_id,
+                "resolved_at": get_hana_timestamp(),
+            })
+            self._set_progress(
+                incident_id, "Unfixable — ticket created for manual review",
+                total, total, status="TICKET_CREATED",
+            )
+            return {
+                "incident_id":    incident_id,
+                "iflow_id":       iflow_id,
+                "status":         "TICKET_CREATED",
+                "success":        False,
+                "fix_applied":    False,
+                "deploy_success": False,
+                "failed_stage":   "unfixable",
+                "summary":        _unfixable_reason,
+                "root_cause":     rca.get("root_cause"),
+                "proposed_fix":   rca.get("proposed_fix"),
+                "confidence":     rca.get("confidence"),
+                "incident":       get_incident_by_id(incident_id) or working_incident,
+            }
+
         step_base = 2 if total == 5 else 1
         self._set_progress(incident_id, "Verifying iFlow exists…", step_base, total)
-        
+
         # ── Double-check iFlow existence right before fix (in case it was deleted during RCA) ──
         if iflow_id:
             existence_check = await self.verify_iflow_exists(iflow_id)

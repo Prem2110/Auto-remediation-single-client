@@ -37,7 +37,11 @@ API docs: `http://localhost:8080/docs`
 
 - **Autonomous Error Detection** — Continuously polls SAP CPI for failed messages and runtime artifact errors
 - **AI Root Cause Analysis (RCA)** — LangChain agent analyses errors using message logs, SAP notes from vector store, HANA knowledge base, and rule-based classifier
-- **Self-Healing Fix Pipeline** — Downloads iFlow config, applies AI-generated fix, updates and deploys — with automatic unlock handling, 600 s agent timeout, per-stage failure diagnosis, and retry logic
+- **Self-Healing Fix Pipeline** — Downloads iFlow config, reads and understands every iFlow component (name, purpose, steps, adapters), applies a reasoned fix, updates and deploys — with automatic unlock handling, 600 s agent timeout, per-stage failure diagnosis, and retry logic
+- **Pre-Update XML Validator** — Python validator intercepts every `update-iflow` call before it reaches SAP CPI: checks filepath matches the original, validates XML is well-formed, rejects `ifl:property` at collaboration level, and blocks version attribute changes. Validation errors are returned to the LLM as specific actionable messages so it can self-correct in the same run
+- **SFTP Error Routing** — All SFTP-class errors (`no such file`, `permission denied`, `auth fail`, `hostkey`, `jsch`, quota exceeded, etc.) are classified as `SFTP_ERROR` and routed directly to `TICKET_CREATED` — the agent never wastes a fix attempt on errors that require server-side action
+- **Backend vs Adapter Error Split** — HTTP 5xx errors (`BACKEND_ERROR`) are routed to `TICKET_CREATED` (backend team must act); HTTP 4xx errors (`ADAPTER_CONFIG_ERROR`) are routed to `AUTO_FIX` (iFlow receiver adapter is misconfigured and can be corrected); HTTP 429 rate-limiting is classified as `CONNECTIVITY_ERROR` and retried
+- **Recommended Action Field** — Every incident detail response includes a `recommended_action` one-liner in `ai_recommendation` — status-aware (e.g. "Fix was uploaded but deployment failed — check CPI deploy logs") with fallback to error-type hint — so API consumers and dashboard users always know the exact next step
 - **iFlow Example Reference** — Agent calls `list-iflow-examples` / `get-iflow-example` (MCP) to use stored S3 components as structural reference for complex fixes
 - **Deleted iFlow Detection** — Pre-flight verification prevents wasted fix attempts on deleted artifacts; marks incidents as `ARTIFACT_DELETED`
 - **HANA Vector Store Integration** — Cosine similarity search over `SAP_HELP_DOCS` (20,000+ scraped SAP notes, 3072-dim embeddings) retrieves top 5 relevant notes to enrich RCA context
@@ -319,10 +323,11 @@ auto-remediation/
 │   ├── vector_store.py            # HANA SAP_HELP_DOCS cosine similarity search for RCA
 │   └── xsd_handler.py             # XSD parsing and validation
 │
-├── rules/                         # Coding standards for Claude Code
+├── rules/                         # Coding standards + fix agent reference
 │   ├── coding-style.md
 │   ├── testing.md
-│   └── security.md
+│   ├── security.md
+│   └── sap_cpi_iflow_xml_patterns.md  # SAP CPI XML structural rules injected into fix prompt
 │
 ├── scrape_sap_docs.py             # Playwright-based scraper — me.sap.com SAP Notes → HANA
 ├── vectorize_docs.py              # Generate 3072-dim embeddings for SAP_HELP_DOCS via AI Core
@@ -368,13 +373,17 @@ Error detected
       │    • Calls get_message_logs            │    • Keyword matching on error text
       │    • Retrieves SAP notes from vector   │    • Returns error_type + confidence
       │      store (HANA SAP_HELP_DOCS)        │
-      │    • Generates root_cause + fix        │
+      │    • Produces conceptual diagnosis     │
+      │      (what type of problem, not XML    │
+      │       instructions)                   │
       │    • Returns confidence score          │
       │                                        │
       └─────────── max(LLM_conf, classifier_conf) ── final_confidence
                                     │
                     If proposed_fix empty → use FALLBACK_FIX_BY_ERROR_TYPE
 ```
+
+**RCA output (`proposed_fix`) is a conceptual diagnosis**, not XML editing instructions — e.g. *"XPath expression uses namespace prefix `d:` but no namespace is declared"*. The fix agent reads the actual iFlow and determines the precise XML change itself.
 
 **Vector Store Integration:**
 - Retrieves top 5 relevant SAP notes from `SAP_HELP_DOCS` table (20,000+ notes)
@@ -400,13 +409,21 @@ Error detected
 2. Pre-flight unlock            — automatically cancel any existing iFlow edit session
 3. Run RCA (if needed)         — LLM + vector store + knowledge base + classifier
 4. Re-verify iFlow exists       — double-check artifact wasn't deleted during RCA
-5. Download iFlow config        — MCP: get-iflow
-6. Apply fix                    — LLM modifies iFlow XML (using example reference if fetched)
-7. Upload updated iFlow         — MCP: update-iflow (verified with strict output checking)
-8. Deploy iFlow                 — MCP: deploy-iflow (verified, mandatory)
-9. Fetch deploy errors          — retrieve detailed error info if deployment fails
-10. Replay message              — retry original failed message (if applicable)
-11. Persist result              — update AUTONOMOUS_INCIDENTS + upsert FIX_PATTERNS
+5. Download iFlow config        — MCP: get-iflow (sets validator context)
+6. Analyse iFlow structure      — agent walks every component: sender, all steps, receiver
+                                   identifies the specific step responsible for the error
+7. Apply fix                    — LLM determines precise XML change from structure + RCA hint
+8. Pre-update validation        — Python validator checks XML before any SAP CPI call:
+                                   • filepath matches original from get-iflow
+                                   • XML is well-formed
+                                   • no ifl:property at collaboration root level
+                                   • no version attributes changed
+                                   If validation fails → error returned to LLM to self-correct
+9. Upload updated iFlow         — MCP: update-iflow (only reached if validation passes)
+10. Deploy iFlow                 — MCP: deploy-iflow (verified, mandatory)
+11. Fetch deploy errors          — retrieve detailed error info if deployment fails
+12. Replay message               — retry original failed message (if applicable)
+13. Persist result               — update AUTONOMOUS_INCIDENTS + upsert FIX_PATTERNS
 ```
 
 **iFlow Example Reference (STEP 0):**
@@ -430,14 +447,23 @@ Error detected
 
 ### Error Classification
 
-| Error Type | Default Action | Auto-replay |
-|---|---|---|
-| `MAPPING_ERROR` | AUTO_FIX | Yes |
-| `DATA_VALIDATION` | AUTO_FIX | Yes |
-| `AUTH_ERROR` | AUTO_FIX | Yes |
-| `CONNECTIVITY_ERROR` | RETRY | Yes |
-| `BACKEND_ERROR` | AUTO_FIX | Yes |
-| `UNKNOWN_ERROR` | PENDING_APPROVAL | No |
+| Error Type | Default Action | Auto-replay | Keywords |
+|---|---|---|---|
+| `MAPPING_ERROR` | AUTO_FIX | Yes | `mappingexception`, `does not exist in target`, `target structure` |
+| `DATA_VALIDATION` | AUTO_FIX | Yes | `mandatory`, `required field`, `null value`, `validation failed` |
+| `AUTH_ERROR` | AUTO_FIX | Yes | `401`, `403`, `unauthorized`, `expired`, `certificate`, `ssl`, `tls` |
+| `CONNECTIVITY_ERROR` | RETRY | Yes | `connection refused`, `connect timed out`, `unreachable`, `socketexception`, `429`, `too many requests`, `rate limit` |
+| `ADAPTER_CONFIG_ERROR` | AUTO_FIX | Yes | `400`, `bad request`, `404`, `not found`, `422`, `unprocessable`, `405`, `method not allowed` |
+| `BACKEND_ERROR` | TICKET_CREATED | No | `500`, `internal server error`, `502`, `bad gateway`, `503`, `service unavailable`, `backend` |
+| `SFTP_ERROR` | TICKET_CREATED | No | `no such file`, `no such directory`, `sftp`, `permission denied`, `jsch`, `sshexception`, `auth fail`, `authentication failed`, `publickey`, `hostkey`, `known hosts`, `file already exists`, `quota exceeded`, `no space left` |
+| `UNKNOWN_ERROR` | PENDING_APPROVAL | No | _(fallback)_ |
+
+**Error type rationale:**
+
+- **`ADAPTER_CONFIG_ERROR`** (HTTP 4xx) — the iFlow sent a bad request. The receiver adapter URL path, HTTP method, Content-Type, or Accept headers are wrong inside the iFlow. The agent auto-fixes the adapter config and redeploys.
+- **`BACKEND_ERROR`** (HTTP 5xx) — the backend service is at fault. The iFlow ran correctly and sent a valid request, but the backend returned a server-side error. Nothing in the iFlow XML can fix this — a support ticket is created for the backend team. 503/service-unavailable responses are first retried (transient override) before ticketing.
+- **`SFTP_ERROR`** — always routed to `TICKET_CREATED`. SFTP failures (missing directories, authentication, host key, permissions, disk quota) require manual action on the remote SFTP server or credential store. The `root_cause` field contains a specific description of the detected SFTP sub-type.
+- **HTTP 429 / rate limiting** — reclassified as `CONNECTIVITY_ERROR` and retried automatically; rate limiting is transient and does not indicate an iFlow config problem.
 
 ---
 
@@ -776,6 +802,68 @@ curl -X POST http://localhost:8080/autonomous/manual_trigger
 
 ---
 
+## iFlow XML Validator
+
+The validator runs as a Python gate inside `MultiMCP.execute()` — every `update-iflow` call passes through it before any HTTP request is made to SAP CPI.
+
+### What it checks
+
+| Check | What it catches |
+|---|---|
+| **Filepath match** | LLM submitted a different `.iflw` filename than what was returned by `get-iflow` (e.g. a filename copied from a previous iFlow). SAP CPI would silently add a second file, leaving the original unchanged. |
+| **XML well-formedness** | Malformed XML (unclosed tags, encoding errors) that SAP CPI would reject on upload. |
+| **Property placement** | `ifl:property` elements inside `<bpmn2:collaboration> extensionElements` instead of inside the specific step that uses them. This causes SAP CPI to return "Unable to process Definition Checks : null". |
+| **Version attributes** | Any `version="..."` attribute changed from the original value. SAP CPI enforces platform-maximum version limits. |
+
+### How it works
+
+```
+execute_incident_fix()
+  │
+  ├─ get-iflow snapshot → _extract_iflow_file() → _fix_ctx.set(filepath, xml)
+  │
+  └─ LLM agent runs...
+       │
+       └─ calls update-iflow
+              │
+              ▼
+       MultiMCP.execute("update-iflow")
+              │
+              ├─ validate_before_update_iflow(args)
+              │    ├─ filepath matches original?   ✓ / ✗
+              │    ├─ XML parses as valid XML?      ✓ / ✗
+              │    ├─ no ifl:property at collab?   ✓ / ✗
+              │    └─ no version changes?          ✓ / ✗
+              │
+              ├─ FAIL → return specific error to LLM (API never called)
+              │          LLM corrects and retries update-iflow
+              │
+              └─ PASS → call SAP CPI update-iflow API
+```
+
+The validator uses Python's `xml.etree.ElementTree` and a `ContextVar` so concurrent fix runs for different iFlows do not share state.
+
+---
+
+## SAP CPI iFlow XML Reference
+
+The file [`rules/sap_cpi_iflow_xml_patterns.md`](rules/sap_cpi_iflow_xml_patterns.md) is loaded at startup and injected into every fix prompt. It contains structural rules and known-failure patterns for the fix agent:
+
+| Section | Rule |
+|---|---|
+| 1 | Minimal Edit Principle — only change what the fix requires |
+| 2 | Property placement — `ifl:property` must be inside the step, not at collaboration root |
+| 3 | XPath namespace declarations — inline `declare namespace prefix='uri';` syntax only |
+| 4 | Content Modifier `srcType` — must be `"Expression"` for Header rows, never `"Constant"` |
+| 5 | Component version limits — EndEvent ≤ 1.0, ExceptionSubprocess ≤ 1.1, SOAP ≤ 1.11 |
+| 6 | Router default route — every `exclusiveGateway` must have a default outgoing route |
+| 7 | Adapter channels — never create a channel with empty or placeholder values |
+| 8 | Groovy script paths — model reference is `/script/<File>.groovy`, not full archive path |
+| 9 | `update-iflow` filepath — must be extracted from `get-iflow` output, never guessed |
+| 10 | Pre-update self-check checklist |
+
+---
+
 ## HANA Knowledge Base
 
 The system queries `SAP_HELP_DOCS` in HANA Cloud to retrieve relevant SAP notes during RCA. Entries are injected into the LLM prompt as context, improving the quality and specificity of generated fixes.
@@ -996,6 +1084,28 @@ Core incident tracking table. One row per detected error.
 | `fix_summary` | Result of fix execution |
 | `occurrence_count` | Recurring error counter |
 | `incident_group_key` | Deduplication hash |
+
+**`ai_recommendation` object** (returned on every incident detail response):
+
+| Field | Description |
+|---|---|
+| `diagnosis` | AI-generated root cause description |
+| `suggested_fix` | Conceptual fix description from RCA |
+| `confidence` | RCA confidence score (0.0–1.0) |
+| `affected_component` | iFlow step identified as root cause |
+| `recommended_action` | **One-liner telling the caller exactly what to do next.** Status-aware — shows a status-specific message first (e.g. deployment failure instructions), falling back to an error-type hint if no status hint applies. |
+| `can_generate_fix` | `true` if the agent can attempt an auto-fix right now |
+
+Example `recommended_action` values by scenario:
+
+| Scenario | `recommended_action` |
+|---|---|
+| `ADAPTER_CONFIG_ERROR` detected | `"iFlow receiver adapter is misconfigured (HTTP 4xx) — agent is fixing the endpoint URL, method, or headers."` |
+| `BACKEND_ERROR` → ticket created | `"A support ticket has been created — waiting for the responsible team to resolve the underlying issue."` |
+| `SFTP_ERROR` | `"SFTP server-side issue — verify the target directory exists and the SFTP user has write/read access. Re-trigger the iFlow once resolved."` |
+| `FIX_FAILED_DEPLOY` | `"Fix was uploaded but deployment failed — check CPI deploy logs and retry deploy."` |
+| `FIX_VERIFIED` | `"Fix was applied and verified successfully — no further action needed."` |
+| `AWAITING_APPROVAL` | `"Fix is ready but requires human approval before it is applied."` |
 
 **Incident lifecycle:**
 

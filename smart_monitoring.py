@@ -62,6 +62,17 @@ def _get_mcp():
     return mgr
 
 
+def _recommended_action(status: str, error_type: str) -> str:
+    """Return a one-liner action hint for the given status/error_type pair."""
+    import main as _main  # noqa: PLC0415
+    status_hints = getattr(_main, "_STATUS_ACTION_HINTS", {})
+    error_hints  = getattr(_main, "ACTION_HINTS", {})
+    return (
+        status_hints.get(status or "")
+        or error_hints.get(error_type or "", "No action hint available.")
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PYDANTIC MODELS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1717,6 +1728,9 @@ async def get_fix_status(incident_id: str):
             "proposed_fix":        incident.get("proposed_fix"),
             "rca_confidence":      incident.get("rca_confidence"),
             "iflow_id":            incident.get("iflow_id"),
+            "recommended_action":  _recommended_action(
+                incident.get("status", ""), incident.get("error_type", "")
+            ),
         }
         
         # Log the complete fix status response for terminal states
@@ -1752,6 +1766,9 @@ async def get_fix_status(incident_id: str):
         "root_cause":          progress.get("root_cause"),
         "proposed_fix":        progress.get("proposed_fix"),
         "rca_confidence":      progress.get("rca_confidence"),
+        "recommended_action":  _recommended_action(
+            in_progress_status, progress.get("error_type", "")
+        ),
     }
 
 
