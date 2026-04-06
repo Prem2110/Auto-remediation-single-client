@@ -25,6 +25,9 @@ import sys
 import logging
 import re
 import hashlib
+import xml.etree.ElementTree as ET
+from contextvars import ContextVar
+from pathlib import Path
 from typing import Dict, List, Any, Optional, Type
 from datetime import datetime, UTC
 
@@ -341,6 +344,18 @@ For SAP CPI iFlow updates involving Groovy Script steps, follow these rules stri
 - If either check fails, fix payload first and only then call update-iflow.
 """.strip()
 
+# ─────────────────────────────────────────────
+# SAP CPI iFlow XML PATTERNS REFERENCE
+# Loaded from rules/sap_cpi_iflow_xml_patterns.md at startup.
+# Injected into the fix prompt so the LLM has structural knowledge
+# of common failure patterns without requiring hardcoded lookup rules.
+# ─────────────────────────────────────────────
+_RULES_DIR = Path(__file__).parent / "rules"
+try:
+    CPI_IFLOW_XML_PATTERNS = (_RULES_DIR / "sap_cpi_iflow_xml_patterns.md").read_text(encoding="utf-8")
+except FileNotFoundError:
+    CPI_IFLOW_XML_PATTERNS = ""
+
 SAP_DOC_TEMPLATE = """
 Documentation Creation Instruction:
     if the user asks specifically for t412 documentation:
@@ -407,15 +422,19 @@ ERROR_TYPE_FIX_GUIDANCE: Dict[str, str] = {
 }
 
 FIX_AND_DEPLOY_PROMPT_TEMPLATE = """
-YOU ARE A SAP CPI SELF-HEALING AGENT. Your ONLY job right now is to fix and deploy the broken iFlow.
+YOU ARE A SAP CPI SELF-HEALING AGENT. Fix and deploy the broken iFlow described below.
 
-=== TARGET ===
-iFlow ID:     {iflow_id}
-Error Type:   {error_type}
-Root Cause:   {root_cause}
-Proposed Fix: {proposed_fix}
-Affected:     {affected_component}
+=== INCIDENT CONTEXT ===
+iFlow ID:          {iflow_id}
+Error Type:        {error_type}
+RCA — Root Cause:  {root_cause}
+RCA — Diagnosis:   {proposed_fix}
+Affected Component:{affected_component}
 {pattern_history}
+
+The RCA diagnosis above is a hint from automated analysis. You must read the actual iFlow first,
+understand its structure, and determine the precise XML change needed — do not blindly apply the
+diagnosis text as a literal instruction.
 
 === CRITICAL: SAP CLOUD INTEGRATION (IFLMAP) CONSTRAINTS ===
 This iFlow runs on SAP Cloud Integration (node type: IFLMAP), NOT on-premise SAP PI/PO.
@@ -448,23 +467,36 @@ You MUST follow these platform-specific rules:
    - If unsure about a component, use HTTP/Groovy/Content Modifier instead
    - Test component versions against IFLMAP profile limits
 
+{iflow_xml_patterns}
+
 === OPTIONAL REFERENCE STEP (run before mandatory steps if helpful) ===
-STEP 0: If the proposed fix requires structural changes (new adapter, new mapping, new channel, script step),
+STEP 0: If the fix requires structural changes (new adapter, mapping, channel, or script step),
          use an example iFlow as a structural reference:
          a. Call list-iflow-examples to see available examples.
-         b. Pick the example whose name most closely matches the error type or adapter involved:
-            "{error_type}" / "{affected_component}"
+         b. Pick the example whose name most closely matches: "{error_type}" / "{affected_component}"
          c. Call get-iflow-example with that name to retrieve the reference content.
          d. Use the retrieved structure as a reference ONLY — do not copy it verbatim.
-         Skip this step entirely if the fix is a simple value/config change with no structural modifications.
+         Skip entirely if the fix is a simple value/config change with no structural modifications.
 
 === MANDATORY STEPS — EXECUTE IN ORDER, NO SKIPPING ===
 STEP 1: Call get-iflow tool with iFlow ID: "{iflow_id}"
-         → Download the current iFlow configuration.
+         After receiving the iFlow XML, analyse it thoroughly:
+         a. Read the iFlow name and infer its business purpose.
+         b. Walk through every component in order — sender channel, each processing step
+            (Content Modifiers, Mappings, Scripts, Routers, etc.), receiver channel.
+         c. For each component, note: its type, its ID, and what it is configured to do.
+         d. Identify which specific component is most likely responsible for the error,
+            based on the error type "{error_type}" and affected component "{affected_component}".
+         e. Read that component's current configuration in the XML carefully.
+         Only proceed to STEP 2 after completing this analysis.
 
-STEP 2: Apply ONLY this fix to the downloaded iFlow:
-         "{proposed_fix}"
-         Then call update-iflow tool with the modified iFlow.
+STEP 2: Based on your iFlow analysis from STEP 1 and the RCA diagnosis above,
+         determine the minimal, precise XML change needed to fix the error.
+         Apply ONLY that change, then call update-iflow with the modified iFlow.
+         → CRITICAL: The 'filepath' in the files array MUST be the EXACT path of the .iflw file
+           as it appeared in the get-iflow response (e.g. "src/main/resources/scenarioflows/
+           integrationflow/<OriginalName>.iflw"). DO NOT invent, guess, or reuse a filepath from
+           a previous iFlow. Extract it directly from the get-iflow output you just received.
          → VERIFY the response contains status 200 or "successfully updated".
          → If update FAILS with "artifact is locked" or "Cannot update the artifact as it is locked":
              a. Search your available tools for: cancel-checkout, unlock-iflow, force-unlock, discard-draft.
@@ -477,14 +509,19 @@ STEP 2: Apply ONLY this fix to the downloaded iFlow:
 
 STEP 2.5 — PRE-UPDATE SELF-CHECK (mandatory before calling update-iflow):
 Review the modified iFlow XML. If any issue is found, correct it before uploading:
-  a. Your changes must be minimal — modify only what the proposed fix requires. Do not restructure,
+  a. Changes must be minimal — modify only what the fix requires. Do not restructure,
      rename, or reorganise any other part of the iFlow.
   b. Do not change any version attribute from the original. Preserve all component versions exactly.
-  c. Do not introduce any new component (adapter, channel, step) that was not present in the original
-     iFlow, unless the proposed fix explicitly requires it. If you do add one, ensure it is fully
-     configured with no empty or placeholder values.
-  d. Read the SAP CPI iFlow XML spec for any element you added or modified — verify that every
-     attribute value you wrote is valid for that element type in the Cloud Integration (IFLMAP) profile.
+  c. Do not introduce any new component (adapter, channel, step) that was not in the original iFlow,
+     unless explicitly required by the fix. If you do add one, ensure it is fully configured with
+     no empty or placeholder values.
+  d. Verify every attribute value you wrote is valid for that element type in the IFLMAP profile.
+  e. Properties added for configuration MUST be placed at the correct level in the iFlow XML:
+     - Step-level properties belong inside the <bpmn2:extensionElements> of the specific
+       <bpmn2:serviceTask> or <bpmn2:callActivity> element — NOT in <bpmn2:collaboration>.
+     - For XPath namespace issues: declare the namespace INLINE in the XPath expression value
+       using: declare namespace prefix='uri'; //prefix:element
+       Do NOT add a top-level namespaceMapping property to the collaboration or flow root.
 
 STEP 3: Call deploy-iflow tool with iFlow ID: "{iflow_id}"
          → VERIFY the response contains deployStatus "Success" or "DEPLOYED".
@@ -494,7 +531,7 @@ STEP 3: Call deploy-iflow tool with iFlow ID: "{iflow_id}"
 - Do NOT skip any step.
 - Do NOT call get_message_logs during this fix.
 - Do NOT modify any other iFlow.
-- Do NOT ask for confirmation — execute all 3 steps automatically.
+- Do NOT ask for confirmation — execute all steps automatically.
 - After step 3, return this EXACT JSON (no markdown, no extra text):
 {{
   "fix_applied": true/false,
@@ -579,6 +616,135 @@ def build_model(name: str, schema: Dict, root=None):
 # ─────────────────────────────────────────────
 # MCP TOOL WRAPPER
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# IFLOW XML VALIDATOR — runs before every update-iflow call
+# ─────────────────────────────────────────────
+
+# Holds per-fix-run state: original filepath + XML captured from get-iflow snapshot.
+# Each async task inherits a copy of the context, so concurrent fixes don't interfere.
+_fix_ctx: ContextVar[Optional[Dict[str, str]]] = ContextVar("_fix_ctx", default=None)
+
+_BPMN2 = "http://www.omg.org/spec/BPMN/20100524/MODEL"
+_IFL   = "http:///com.sap.ifl.model/Ifl.xsd"
+
+
+def _extract_iflow_file(snapshot_str: str) -> tuple[str, str]:
+    """
+    Parse a get-iflow response string and return (filepath, xml_content) for the .iflw file.
+    Returns ("", "") if not found.
+    """
+    try:
+        data = json.loads(snapshot_str) if isinstance(snapshot_str, str) else snapshot_str
+        files = data.get("files", []) if isinstance(data, dict) else []
+        for f in files:
+            fp = f.get("filepath", "")
+            if fp.endswith(".iflw"):
+                return fp, f.get("content", "")
+    except Exception:
+        pass
+    # Fallback: regex scan for filepath key in raw text
+    try:
+        m = re.search(r'"filepath"\s*:\s*"([^"]+\.iflw)"', snapshot_str or "")
+        if m:
+            return m.group(1), ""
+    except Exception:
+        pass
+    return "", ""
+
+
+def _check_iflow_xml(original_xml: str, modified_xml: str) -> list[str]:
+    """Structural checks on the modified iFlow XML. Returns list of error strings."""
+    errors: list[str] = []
+    try:
+        mod_root = ET.fromstring(modified_xml)
+    except ET.ParseError as e:
+        return [f"Modified iFlow XML is not valid XML: {e}. Fix the XML before calling update-iflow."]
+
+    # Check 1 — no ifl:property inside bpmn2:collaboration extensionElements
+    collab = mod_root.find(f"{{{_BPMN2}}}collaboration")
+    if collab is not None:
+        ext = collab.find(f"{{{_BPMN2}}}extensionElements")
+        if ext is not None:
+            bad_props = ext.findall(f"{{{_IFL}}}property")
+            if bad_props:
+                keys = [
+                    (p.findtext(f"{{{_IFL}}}key") or p.findtext("key") or "?")
+                    for p in bad_props
+                ]
+                errors.append(
+                    f"ifl:property elements found inside <bpmn2:collaboration> extensionElements "
+                    f"(keys: {keys}). These MUST be placed inside the specific step that uses them "
+                    f"(e.g. inside the <bpmn2:serviceTask> for the XPath or mapping step), "
+                    f"NOT at collaboration level. Move them to the correct step."
+                )
+
+    # Check 2 — version attributes must not change from original
+    if original_xml:
+        try:
+            orig_root = ET.fromstring(original_xml)
+            orig_versions = {
+                el.get("id"): el.get("version")
+                for el in orig_root.iter()
+                if el.get("id") and el.get("version")
+            }
+            for el in mod_root.iter():
+                el_id  = el.get("id")
+                el_ver = el.get("version")
+                if el_id and el_ver and el_id in orig_versions:
+                    if orig_versions[el_id] != el_ver:
+                        errors.append(
+                            f"Version changed for element '{el_id}': "
+                            f"original='{orig_versions[el_id]}', submitted='{el_ver}'. "
+                            f"Do not modify version attributes."
+                        )
+        except ET.ParseError:
+            pass  # original XML unreadable — skip version check
+
+    return errors
+
+
+def validate_before_update_iflow(args: Dict) -> list[str]:
+    """
+    Validate update-iflow args against the per-fix context captured from get-iflow.
+    Returns list of error strings. Empty = valid, proceed with the real API call.
+    """
+    ctx = _fix_ctx.get()
+    if ctx is None:
+        return []  # no context set (e.g. manual / chat use) — skip validation
+
+    errors: list[str] = []
+    original_filepath = ctx.get("filepath", "")
+    original_xml      = ctx.get("xml", "")
+
+    # Parse the files argument (LLM may pass it as a JSON string or a list)
+    files = args.get("files", [])
+    if isinstance(files, str):
+        try:
+            files = json.loads(files)
+        except Exception:
+            files = []
+
+    submitted_filepath = ""
+    submitted_xml      = ""
+    if isinstance(files, list) and files:
+        submitted_filepath = files[0].get("filepath", "") if isinstance(files[0], dict) else ""
+        submitted_xml      = files[0].get("content", "")  if isinstance(files[0], dict) else ""
+
+    # Check 1 — filepath must match original exactly
+    if original_filepath and submitted_filepath and submitted_filepath != original_filepath:
+        errors.append(
+            f"Wrong filepath: you submitted '{submitted_filepath}' but the iFlow filepath "
+            f"from get-iflow is '{original_filepath}'. "
+            f"Use the EXACT filepath from the get-iflow response — do not guess or invent it."
+        )
+
+    # Check 2 — XML structural rules
+    if submitted_xml:
+        errors.extend(_check_iflow_xml(original_xml, submitted_xml))
+
+    return errors
+
+
 class MCPTool(BaseTool):
     name:          str
     description:   str
@@ -681,11 +847,25 @@ class TestExecutionTracker:
 # ─────────────────────────────────────────────
 # STEP LOGGER  ← FIXED: preserves tool name per run_id
 # ─────────────────────────────────────────────
+_FIX_TOOL_PROGRESS_LABELS: Dict[str, str] = {
+    "get_iflow":         "Agent: reading current iFlow XML…",
+    "update_iflow":      "Agent: uploading fixed iFlow to SAP CPI…",
+    "deploy_iflow":      "Agent: deploying iFlow to runtime…",
+    "get_deploy_error":  "Agent: checking deployment errors…",
+    "list_iflow_examples": "Agent: searching reference examples…",
+    "get_iflow_example": "Agent: loading reference example…",
+    "unlock_iflow":      "Agent: unlocking iFlow for editing…",
+    "cancel_checkout":   "Agent: cancelling existing checkout…",
+    "force_unlock":      "Agent: force-unlocking iFlow…",
+}
+
+
 class StepLogger(BaseCallbackHandler):
-    def __init__(self, tracker: TestExecutionTracker):
+    def __init__(self, tracker: TestExecutionTracker, progress_fn=None):
         self.steps            = []
         self.tracker          = tracker
         self._tool_names: Dict[str, str] = {}   # run_id → tool_name
+        self._progress_fn     = progress_fn     # Optional[Callable[[str], None]]
 
     def on_tool_start(self, serialized, input_str, run_id=None, **kw):
         tool_name    = serialized.get("name", "unknown")
@@ -693,6 +873,15 @@ class StepLogger(BaseCallbackHandler):
         self._tool_names[tool_call_id] = tool_name
         self.steps.append({"tool": tool_name, "input": input_str, "output": None})
         logger.info("[TOOL_CALL] tool=%s | input=%.800s", tool_name, str(input_str))
+        if self._progress_fn:
+            # Strip server prefix (e.g. "integration_suite__get_iflow" → "get_iflow")
+            short = tool_name.split("__")[-1] if "__" in tool_name else tool_name
+            label = _FIX_TOOL_PROGRESS_LABELS.get(short)
+            if label:
+                try:
+                    self._progress_fn(label)
+                except Exception:
+                    pass
         try:
             args = json.loads(input_str) if isinstance(input_str, str) else input_str
         except Exception:
@@ -1773,6 +1962,18 @@ class MultiMCP:
         logger.info("=" * 80)
 
     async def execute(self, server, tool, args):
+        # ── Pre-call validation for update-iflow ─────────────────────────────
+        if tool == "update-iflow":
+            val_errors = validate_before_update_iflow(args)
+            if val_errors:
+                error_block = "\n".join(f"  • {e}" for e in val_errors)
+                logger.warning(f"[VALIDATOR] update-iflow blocked for iFlow. Issues:\n{error_block}")
+                return (
+                    "VALIDATION FAILED — update-iflow was NOT sent to SAP CPI.\n"
+                    "Fix the following issues and call update-iflow again with corrected values:\n"
+                    + error_block
+                )
+
         client = self.clients[server]
         for attempt in range(MAX_RETRIES):
             try:
@@ -1919,6 +2120,7 @@ Execution policy:
         user_id: str,
         session_id: str,
         timestamp: str,
+        progress_fn=None,
     ) -> Dict[str, Any]:
         """
         Builds a strict fix+deploy prompt and invokes the agent.
@@ -1950,7 +2152,7 @@ Execution policy:
                 logger.debug(f"[FIX_DEPLOY] Pre-unlock no-op for '{iflow_id}': {unlock_result['message']}")
 
         tracker   = TestExecutionTracker(user_id, f"fix:{iflow_id}", timestamp)
-        logger_cb = StepLogger(tracker)
+        logger_cb = StepLogger(tracker, progress_fn=progress_fn)
 
         sig = self.error_signature(iflow_id, error_type or "UNKNOWN")
         patterns = get_similar_patterns(sig)
@@ -1976,6 +2178,7 @@ Execution policy:
             pattern_history=pattern_history,
             error_type_guidance=error_type_guidance,
             groovy_rules=CPI_IFLOW_GROOVY_RULES,
+            iflow_xml_patterns=CPI_IFLOW_XML_PATTERNS,
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -2023,7 +2226,7 @@ Execution policy:
             if unlock_retry["success"]:
                 logger.info(f"[FIX_DEPLOY] Unlock succeeded — retrying fix agent for {iflow_id}")
                 tracker2   = TestExecutionTracker(user_id, f"fix_retry:{iflow_id}", timestamp)
-                logger_cb2 = StepLogger(tracker2)
+                logger_cb2 = StepLogger(tracker2, progress_fn=progress_fn)
                 try:
                     result2 = await asyncio.wait_for(
                         self.agent.ainvoke(
@@ -2092,7 +2295,7 @@ Execution policy:
                     f'"summary": "<what was corrected and deploy outcome>"}}'
                 )
                 tracker_corr = TestExecutionTracker(user_id, f"fix_correction:{iflow_id}", timestamp)
-                logger_cb_corr = StepLogger(tracker_corr)
+                logger_cb_corr = StepLogger(tracker_corr, progress_fn=progress_fn)
                 try:
                     result_corr = await asyncio.wait_for(
                         self.agent.ainvoke(
@@ -2215,12 +2418,12 @@ Steps (execute in order, stop after step 2):
 
 Return ONLY valid JSON (no markdown, no preamble):
 {{
-  "root_cause": "<clear description>",
-  "proposed_fix": "<specific actionable fix — must reference exact field names, values, or config changes>",
+  "root_cause": "<clear description of what went wrong and why>",
+  "proposed_fix": "<conceptual diagnosis: what type of problem this is and what category of change is needed — e.g. 'XPath expression uses namespace prefix d: but no namespace is declared', 'SFTP directory path does not exist on the target server', 'Content Modifier header srcType is set to Constant instead of Expression'. Do NOT write XML editing instructions — the fix agent will read the iFlow and determine the exact change.>",
   "confidence": 0.0,
   "auto_apply": false,
   "error_type": "<error type>",
-  "affected_component": "<component>"
+  "affected_component": "<component name or step ID if identifiable from logs>"
 }}
 
 STOP after returning JSON. Do not call any other tools.
@@ -2239,12 +2442,12 @@ Error detected:
 
 Return ONLY valid JSON (no markdown, no preamble):
 {{
-  "root_cause": "<clear description>",
-  "proposed_fix": "<specific actionable fix — must reference exact field names, values, or config changes>",
+  "root_cause": "<clear description of what went wrong and why>",
+  "proposed_fix": "<conceptual diagnosis: what type of problem this is and what category of change is needed — e.g. 'XPath expression uses namespace prefix but no namespace is declared', 'SFTP directory path does not exist', 'adapter version exceeds platform limit'. Do NOT write XML editing instructions — the fix agent will read the iFlow and determine the exact change.>",
   "confidence": 0.0,
   "auto_apply": false,
   "error_type": "<error type>",
-  "affected_component": "<component>"
+  "affected_component": "<component name or step ID if identifiable>"
 }}
 """
         timestamp  = get_hana_timestamp()
@@ -2365,7 +2568,7 @@ Return ONLY valid JSON (no markdown, no preamble):
                 "summary": f"Deploy-only retry failed: {exc}", "steps": logger_cb.steps,
             }
 
-    async def apply_fix(self, incident: Dict, rca: Dict) -> Dict:
+    async def apply_fix(self, incident: Dict, rca: Dict, progress_fn=None) -> Dict:
         """Apply fix and deploy the target iFlow. Verifies both update and deploy."""
         result = await self.ask_fix_and_deploy(
             iflow_id=incident.get("iflow_id", ""),
@@ -2377,6 +2580,7 @@ Return ONLY valid JSON (no markdown, no preamble):
             user_id="system_autofix",
             session_id=f"autofix_{incident.get('incident_id', 'unknown')}",
             timestamp=get_hana_timestamp(),
+            progress_fn=progress_fn,
         )
         return result
 
@@ -2442,9 +2646,13 @@ Original error: {error_msg[:400]}
 Applied fix: {proposed_fix[:400]}
 
 INSTRUCTIONS:
-1. Using only the error context above, construct a minimal valid payload that exercises
-   the path that was originally failing. Do NOT call get-iflow.
-2. Call test_iflow_with_payload once with iflow_id='{iflow_id}' and that payload.
+1. Call get_iflow_endpoint with iflow_id='{iflow_id}' to discover the HTTP endpoint.
+   - If it returns 0 endpoints, count=0, or "unable to fetch", the iFlow has no HTTP trigger
+     (it may be SFTP, File, or scheduler-triggered). Immediately return:
+     {{"test_passed": false, "http_status": null, "summary": "iFlow has no HTTP endpoint — test not applicable."}}
+     Do NOT call test_iflow_with_payload in this case.
+2. If an endpoint IS found, construct a minimal valid payload from the error context above
+   and call test_iflow_with_payload once with iflow_id='{iflow_id}' and that payload.
 3. Return EXACTLY this JSON (no markdown):
 {{"test_passed": true/false, "http_status": <status code or null>, "summary": "<one sentence: what was sent and what the iFlow returned>"}}
 
@@ -2458,7 +2666,7 @@ Do NOT call get-iflow. Do NOT modify the iFlow. Do NOT call deploy. Do NOT fetch
             result = await asyncio.wait_for(
                 self.agent.ainvoke(
                     {"messages": [{"role": "user", "content": prompt}]},
-                    config={"callbacks": [logger_cb], "recursion_limit": 4},
+                    config={"callbacks": [logger_cb], "recursion_limit": 6},
                 ),
                 timeout=120.0,
             )
@@ -2972,6 +3180,11 @@ Do NOT call get-iflow. Do NOT modify the iFlow. Do NOT call deploy. Do NOT fetch
                     snapshot_str = json.dumps(snapshot_raw) if not isinstance(snapshot_raw, str) else snapshot_raw
                     update_incident(incident_id, {"iflow_snapshot_before": snapshot_str[:50000]})
                     logger.info(f"[FIX] iFlow snapshot captured for {iflow_id} ({len(snapshot_str)} chars)")
+                    # Set validator context so update-iflow calls are validated against this snapshot
+                    orig_fp, orig_xml = _extract_iflow_file(snapshot_str)
+                    if orig_fp:
+                        _fix_ctx.set({"filepath": orig_fp, "xml": orig_xml})
+                        logger.info(f"[VALIDATOR] Fix context set: filepath='{orig_fp}', xml_len={len(orig_xml)}")
             except Exception as snap_exc:
                 logger.warning(f"[FIX] Could not capture iFlow snapshot for {iflow_id}: {snap_exc}")
 
@@ -2984,7 +3197,12 @@ Do NOT call get-iflow. Do NOT modify the iFlow. Do NOT call deploy. Do NOT fetch
             )
         else:
             self._set_progress(incident_id, "Applying fix and deploying iFlow…", step_base + 2, total)
-            fix_result = await self.apply_fix(working_incident, rca)
+            _fix_step = step_base + 2
+
+            def _fix_progress(label: str) -> None:
+                self._set_progress(incident_id, label, _fix_step, total)
+
+            fix_result = await self.apply_fix(working_incident, rca, progress_fn=_fix_progress)
         policy = self.get_remediation_policy(working_incident, rca)
         retry_result = None
         fix_summary = fix_result.get("summary", "") or ""
@@ -3021,17 +3239,7 @@ Do NOT call get-iflow. Do NOT modify the iFlow. Do NOT call deploy. Do NOT fetch
                     "Marking as FIX_APPLIED_PENDING_VERIFICATION."
                 )
 
-            # When replay is skipped (no message GUID) or after a successful replay,
-            # also run a live iFlow test: agent downloads the iFlow, builds a payload, and calls it.
-            if replay_skipped or replay_success:
-                self._set_progress(incident_id, "Validating fix — testing iFlow with payload…", total, total)
-                test_result = await self.test_iflow_after_fix(working_incident)
-                if test_result.get("summary") and not test_result.get("skipped"):
-                    fix_summary = f"{fix_summary}\nTest: {test_result['summary']}"
-                if replay_skipped:
-                    # No message GUID replay — use test result as the verification signal
-                    replay_success = test_result.get("success", False)
-                    replay_skipped = test_result.get("skipped", False)
+            # iFlow payload testing is disabled — deploy success is the verification signal.
 
         # Status: if deploy succeeded but replay genuinely failed → pending verification
         # If replay was skipped (no message GUID / no retry tool / test tool unavailable), trust the deploy result

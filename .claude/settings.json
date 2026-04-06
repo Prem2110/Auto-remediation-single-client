@@ -9,7 +9,9 @@
       "Bash(uv run python -c ':*)",
       "Bash(uv run:*)",
       "Bash(uv add:*)",
-      "Bash(del \"c:\\\\Users\\\\PremkumarUthayakumar\\\\Desktop\\\\projects\\\\New folder\\\\auto-remediation\\\\debug_pw_login.py\")"
+      "Bash(del \"c:\\\\Users\\\\PremkumarUthayakumar\\\\Desktop\\\\projects\\\\New folder\\\\auto-remediation\\\\debug_pw_login.py\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('main.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }
