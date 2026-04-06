@@ -1707,6 +1707,8 @@ async def get_fix_status(incident_id: str):
             "total_steps":         final_progress.get("total_steps", 1),
             "steps_done":          final_progress.get("steps_done", []),
             "fix_summary":         incident.get("fix_summary"),
+            "last_failed_stage":   incident.get("last_failed_stage"),
+            "technical_details":   final_progress.get("technical_details"),
             "resolved_at":         incident.get("resolved_at"),
             "verification_status": incident.get("verification_status"),
             "root_cause":          incident.get("root_cause"),
@@ -1738,6 +1740,8 @@ async def get_fix_status(incident_id: str):
         "total_steps":         progress.get("total_steps", 4),
         "steps_done":          progress.get("steps_done", []),
         "fix_summary":         None,
+        "last_failed_stage":   progress.get("failed_stage"),
+        "technical_details":   progress.get("technical_details"),
         "resolved_at":         None,
         "verification_status": None,
         # Context fields populated as soon as the pipeline starts

@@ -37,7 +37,7 @@ API docs: `http://localhost:8080/docs`
 
 - **Autonomous Error Detection** — Continuously polls SAP CPI for failed messages and runtime artifact errors
 - **AI Root Cause Analysis (RCA)** — LangChain agent analyses errors using message logs, SAP notes from vector store, HANA knowledge base, and rule-based classifier
-- **Self-Healing Fix Pipeline** — Downloads iFlow config, applies AI-generated fix, updates and deploys — with automatic unlock handling and retry logic
+- **Self-Healing Fix Pipeline** — Downloads iFlow config, applies AI-generated fix, updates and deploys — with automatic unlock handling, 600 s agent timeout, per-stage failure diagnosis, and retry logic
 - **iFlow Example Reference** — Agent calls `list-iflow-examples` / `get-iflow-example` (MCP) to use stored S3 components as structural reference for complex fixes
 - **Deleted iFlow Detection** — Pre-flight verification prevents wasted fix attempts on deleted artifacts; marks incidents as `ARTIFACT_DELETED`
 - **HANA Vector Store Integration** — Cosine similarity search over `SAP_HELP_DOCS` (20,000+ scraped SAP notes, 3072-dim embeddings) retrieves top 5 relevant notes to enrich RCA context
@@ -538,21 +538,49 @@ Returns granular pipeline progress while a fix is running. Reads from in-memory 
   "step_index": 3,
   "total_steps": 4,
   "steps_done": ["Downloading iFlow configuration…"],
-  "fix_summary": null
+  "fix_summary": null,
+  "last_failed_stage": null,
+  "technical_details": null
 }
 
 // When complete
 {
   "incident_id": "uuid",
   "status": "AUTO_FIXED",
-  "current_step": "Fix applied and deployed successfully",
+  "current_step": "Fix applied and validated successfully",
   "step_index": 4,
   "total_steps": 4,
   "steps_done": ["Downloading iFlow configuration…", "Applying fix and deploying iFlow…"],
   "fix_summary": "iFlow SAP_ERP_Sync updated and deployed successfully.",
+  "last_failed_stage": null,
+  "technical_details": null,
   "resolved_at": "2026-03-30T10:05:00Z"
 }
+
+// When failed
+{
+  "incident_id": "uuid",
+  "status": "FIX_FAILED_DEPLOY",
+  "current_step": "Fix failed — stage: deploy",
+  "step_index": 4,
+  "total_steps": 4,
+  "steps_done": ["Downloading iFlow configuration…", "Applying fix and deploying iFlow…"],
+  "fix_summary": "iFlow content was updated but deployment confirmation timed out.\nTechnical detail: deploy-iflow tool was called but did not return within 600 s…",
+  "last_failed_stage": "deploy",
+  "technical_details": "deploy-iflow tool was called for 'SAP_ERP_Sync' but did not return within 600 s. The SAP CF router likely closed the SSE stream. iFlow content was already updated — check Monitor → Manage Integration Content or use /retry.",
+  "resolved_at": null
+}
 ```
+
+**`last_failed_stage` values and what they mean:**
+
+| Value | Meaning | Action |
+|---|---|---|
+| `deploy` | iFlow was updated but deploy timed out or failed | Check SAP CPI Monitor; use `/retry_fix` (deploy-only) |
+| `update` | iFlow update call timed out or was rejected | No changes applied — use `/retry_fix` (full pipeline) |
+| `agent` | LLM stalled before or during tool calls | No changes applied — use `/retry_fix` |
+| `locked` | iFlow is checked out by another user | Cancel checkout in SAP CPI IFD, then `/retry_fix` |
+| `verification` | iFlow ID not found in Integration Suite | Check `iflow_id` is correct |
 
 #### PATCH `/smart-monitoring/escalations/{ticket_id}`
 
@@ -1119,6 +1147,8 @@ curl -X PATCH http://localhost:8080/smart-monitoring/escalations/<ticket_id> \
 | `Could not open SAP_HELP_DOCS` in HANA Explorer | HANA DB Explorer can't render `REAL_VECTOR` columns in the UI | Use SQL query instead: `SELECT COUNT(*), SUM(CASE WHEN VEC_VECTOR IS NOT NULL THEN 1 ELSE 0 END) FROM SAP_HELP_DOCS` |
 | `autonomous loop stops after N failures` | `MAX_CONSECUTIVE_FAILURES` threshold hit | Check `logs/mcp.log` for the root cause; fix the underlying SAP API issue then restart the loop |
 | iFlow fix applied but deploy fails with lock error | Another user has the iFlow checked out | Call `POST /smart-monitoring/incidents/{id}/retry_fix` — unlock is attempted automatically on retry |
+| `/fix_status` stuck on `FIX_IN_PROGRESS` for > 10 min | Fix agent timed out (600 s limit) — usually deploy-iflow SSE stream dropped by SAP CF router | After timeout, status transitions to `FIX_FAILED_*`; check `last_failed_stage` and `technical_details` in the response, then call `/retry_fix` |
+| `last_failed_stage: deploy` but iFlow seems deployed | Deploy confirmed on SAP CPI side but response never reached the agent (CF idle timeout) | Verify in SAP CPI Monitor → Manage Integration Content; if deployed, manually set status or just monitor for `AUTO_FIXED` on next autonomous cycle |
 
 ---
 

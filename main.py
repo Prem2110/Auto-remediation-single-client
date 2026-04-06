@@ -1188,6 +1188,91 @@ class MultiMCP:
             or ("cannot update the artifact" in text and "locked" in text)
         )
 
+    def _diagnose_timeout(self, steps: List[Dict], iflow_id: str) -> Dict[str, Any]:
+        """Inspect partial step history to determine which pipeline stage timed out.
+
+        Returns a result dict with accurate fix_applied / failed_stage / summary
+        instead of a generic 'agent timed out' message.
+        """
+        tools_called = [str(s.get("tool", "")) for s in steps]
+
+        deploy_called = any("deploy" in t for t in tools_called)
+        update_called = any("update" in t and "iflow" in t for t in tools_called)
+        get_called    = any("get" in t and "iflow" in t for t in tools_called)
+
+        update_ok = False
+        for s in steps:
+            if "update" in str(s.get("tool", "")) and "iflow" in str(s.get("tool", "")):
+                update_ok = self._update_succeeded(str(s.get("output", "")))
+
+        if deploy_called:
+            # deploy-iflow was called but never returned — CF SSE stream likely dropped
+            return {
+                "success": False,
+                "fix_applied": True,   # update already succeeded before deploy was called
+                "deploy_success": False,
+                "failed_stage": "deploy",
+                "technical_details": (
+                    f"deploy-iflow tool was called for '{iflow_id}' but did not return within 600 s. "
+                    "The SAP Cloud Foundry router likely closed the SSE stream while waiting for the "
+                    "async deploy job to complete. The iFlow content was already updated successfully. "
+                    "Check SAP CPI Monitor → Manage Integration Content to confirm deploy status."
+                ),
+                "summary": (
+                    f"iFlow '{iflow_id}' content was updated but deployment confirmation timed out. "
+                    "The deploy may have completed on SAP CPI — verify in Monitor → Manage Integration Content, "
+                    "or use /retry (deploy-only) to redeploy."
+                ),
+            }
+
+        if update_called and not update_ok:
+            return {
+                "success": False,
+                "fix_applied": False,
+                "deploy_success": False,
+                "failed_stage": "update",
+                "technical_details": (
+                    f"update-iflow tool was called for '{iflow_id}' but timed out before returning a result. "
+                    "The iFlow was not modified. Retry the full fix pipeline."
+                ),
+                "summary": (
+                    f"iFlow update for '{iflow_id}' timed out before completing. "
+                    "No changes were applied — retry the fix."
+                ),
+            }
+
+        if get_called:
+            return {
+                "success": False,
+                "fix_applied": False,
+                "deploy_success": False,
+                "failed_stage": "agent",
+                "technical_details": (
+                    f"get-iflow succeeded but the agent timed out before calling update-iflow for '{iflow_id}'. "
+                    "The LLM may have stalled while analysing the iFlow XML. No changes were applied."
+                ),
+                "summary": (
+                    f"iFlow '{iflow_id}' was downloaded but the fix agent timed out before applying changes. "
+                    "No modifications were made — retry the fix."
+                ),
+            }
+
+        # Nothing useful was called (timed out during first LLM inference)
+        return {
+            "success": False,
+            "fix_applied": False,
+            "deploy_success": False,
+            "failed_stage": "agent",
+            "technical_details": (
+                f"Fix agent for '{iflow_id}' timed out before calling any MCP tools. "
+                "The LLM call itself may have stalled. No changes were applied."
+            ),
+            "summary": (
+                f"Fix agent timed out before starting tool calls for '{iflow_id}'. "
+                "No changes were applied — retry the fix."
+            ),
+        }
+
     def evaluate_fix_result(self, steps: List[Dict], answer: str) -> Dict[str, Any]:
         update_ok = False
         deploy_ok = False
@@ -1898,11 +1983,22 @@ Execution policy:
 
         for attempt in range(3):
             try:
-                result = await self.agent.ainvoke(
-                    {"messages": messages},
-                    config={"callbacks": [logger_cb], "recursion_limit": 18},
+                result = await asyncio.wait_for(
+                    self.agent.ainvoke(
+                        {"messages": messages},
+                        config={"callbacks": [logger_cb], "recursion_limit": 18},
+                    ),
+                    timeout=600.0,
                 )
                 break
+            except asyncio.TimeoutError:
+                diagnosis = self._diagnose_timeout(logger_cb.steps, iflow_id)
+                logger.error(
+                    "[FIX_DEPLOY] agent timed out after 600s | iflow=%s | stage=%s | fix_applied=%s | detail=%s",
+                    iflow_id, diagnosis["failed_stage"], diagnosis["fix_applied"],
+                    diagnosis["technical_details"][:200],
+                )
+                return {**diagnosis, "steps": logger_cb.steps}
             except Exception as e:
                 if attempt < 2:
                     await asyncio.sleep(2)
@@ -1930,9 +2026,12 @@ Execution policy:
                 tracker2   = TestExecutionTracker(user_id, f"fix_retry:{iflow_id}", timestamp)
                 logger_cb2 = StepLogger(tracker2)
                 try:
-                    result2 = await self.agent.ainvoke(
-                        {"messages": messages},
-                        config={"callbacks": [logger_cb2], "recursion_limit": 12},
+                    result2 = await asyncio.wait_for(
+                        self.agent.ainvoke(
+                            {"messages": messages},
+                            config={"callbacks": [logger_cb2], "recursion_limit": 12},
+                        ),
+                        timeout=480.0,
                     )
                     final_msg2 = result2["messages"][-1]
                     answer2    = final_msg2.content if hasattr(final_msg2, "content") else str(final_msg2)
@@ -2002,9 +2101,12 @@ Execution policy:
                 tracker_corr = TestExecutionTracker(user_id, f"fix_correction:{iflow_id}", timestamp)
                 logger_cb_corr = StepLogger(tracker_corr)
                 try:
-                    result_corr = await self.agent.ainvoke(
-                        {"messages": [{"role": "user", "content": correction_prompt}]},
-                        config={"callbacks": [logger_cb_corr], "recursion_limit": 12},
+                    result_corr = await asyncio.wait_for(
+                        self.agent.ainvoke(
+                            {"messages": [{"role": "user", "content": correction_prompt}]},
+                            config={"callbacks": [logger_cb_corr], "recursion_limit": 12},
+                        ),
+                        timeout=480.0,
                     )
                     final_msg_corr = result_corr["messages"][-1]
                     answer_corr = (
@@ -2864,22 +2966,37 @@ Rules:
                 human_approved=human_approved,
             )
 
+        # Append technical_details to fix_summary so it's stored and visible via API
+        technical_details = fix_result.get("technical_details", "")
+        if technical_details and not fix_result.get("success"):
+            fix_summary = (
+                f"{fix_summary}\nTechnical detail: {technical_details}"
+                if fix_summary else technical_details
+            )
+
+        failed_stage = fix_result.get("failed_stage", "")
+
         # Mark progress as done — UI stops polling after seeing a terminal status
         done_step = (
             "Fix applied and validated successfully" if fix_result.get("success") and replay_success
             else ("Fix deployed — awaiting message verification" if fix_result.get("success")
-                  else "Fix failed")
+                  else f"Fix failed — stage: {failed_stage}" if failed_stage else "Fix failed")
         )
-        self._set_progress(incident_id, done_step, total, total, status=final_status)
+        self._set_progress(
+            incident_id, done_step, total, total, status=final_status,
+            failed_stage=failed_stage or None,
+            technical_details=technical_details[:300] if technical_details else None,
+        )
         update_incident(incident_id, {
-            "status": final_status,
-            "fix_summary": fix_summary,
-            "resolved_at": get_hana_timestamp() if final_status in {"FIX_VERIFIED", "HUMAN_INITIATED_FIX"} else None,
-            "verification_status": "VERIFIED" if final_status in {"FIX_VERIFIED", "HUMAN_INITIATED_FIX"} else "PENDING",
-            "root_cause": rca.get("root_cause", ""),
-            "proposed_fix": rca.get("proposed_fix", ""),
-            "rca_confidence": rca.get("confidence", 0.0),
-            "affected_component": rca.get("affected_component", ""),
+            "status":               final_status,
+            "fix_summary":          fix_summary,
+            "last_failed_stage":    failed_stage or None,
+            "resolved_at":          get_hana_timestamp() if final_status in {"FIX_VERIFIED", "HUMAN_INITIATED_FIX"} else None,
+            "verification_status":  "VERIFIED" if final_status in {"FIX_VERIFIED", "HUMAN_INITIATED_FIX"} else "PENDING",
+            "root_cause":           rca.get("root_cause", ""),
+            "proposed_fix":         rca.get("proposed_fix", ""),
+            "rca_confidence":       rca.get("confidence", 0.0),
+            "affected_component":   rca.get("affected_component", ""),
             "consecutive_failures": 0 if fix_result.get("success") else (
                 (int(working_incident.get("consecutive_failures") or 0)) + 1
             ),
