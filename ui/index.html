@@ -719,7 +719,11 @@
     <div class="card" style="margin-top:20px">
       <div class="section-header">
         <h2>Pending Approvals</h2>
-        <span id="am-approval-count" class="refresh-note"></span>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span id="am-approval-count" class="refresh-note"></span>
+          <button id="am-approve-all-btn" class="btn btn-success btn-sm" onclick="doApproveAll(true)" style="display:none">✓ Approve All</button>
+          <button id="am-reject-all-btn"  class="btn btn-danger btn-sm"  onclick="doApproveAll(false)" style="display:none">✗ Reject All</button>
+        </div>
       </div>
       <div id="am-approvals-list">
         <div class="empty-state">No pending approvals.</div>
@@ -1236,19 +1240,24 @@ async function refreshAgentMonitor() {
     const approvalList = document.getElementById('am-approvals-list');
     document.getElementById('am-approval-count').textContent =
       approvals.length ? `${approvals.length} waiting` : '';
-    if (approvals.length === 0) {
+    const hasPending = approvals.length > 0;
+    document.getElementById('am-approve-all-btn').style.display = hasPending ? '' : 'none';
+    document.getElementById('am-reject-all-btn').style.display  = hasPending ? '' : 'none';
+    // store current pending ids for bulk actions
+    window._pendingApprovalIds = approvals.map(a => a.incident_id);
+    if (!hasPending) {
       approvalList.innerHTML = '<div class="empty-state">No pending approvals.</div>';
     } else {
       approvalList.innerHTML = approvals.map(a => `
-        <div class="approval-item">
+        <div class="approval-item" id="aprow-${escHtml(a.incident_id)}">
           <span style="font-size:18px">⚠️</span>
           <div class="ap-info">
             <div class="ap-iflow">${escHtml(a.iflow_id || a.incident_id || '—')}</div>
             <div class="ap-fix">${escHtml(a.proposed_fix || a.root_cause || 'Awaiting approval')}</div>
           </div>
           <div style="display:flex;gap:6px;flex-shrink:0">
-            <button class="btn btn-success btn-sm" onclick="doApprove('${escHtml(a.incident_id)}', true)">Approve</button>
-            <button class="btn btn-danger btn-sm"  onclick="doApprove('${escHtml(a.incident_id)}', false)">Reject</button>
+            <button class="btn btn-success btn-sm" onclick="doApprove('${escHtml(a.incident_id)}', true)">✓ Approve</button>
+            <button class="btn btn-danger btn-sm"  onclick="doApprove('${escHtml(a.incident_id)}', false)">✗ Reject</button>
             <button class="btn btn-ghost btn-sm"   onclick="gotoStatusFromAM('${escHtml(a.incident_id)}')">→ Status</button>
           </div>
         </div>`).join('');
@@ -1321,14 +1330,49 @@ async function doManualTrigger() {
 }
 
 async function doApprove(incidentId, approved) {
+  // Disable buttons on the row immediately to prevent double-clicks
+  const row = document.getElementById(`aprow-${incidentId}`);
+  if (row) row.querySelectorAll('button').forEach(b => b.disabled = true);
   try {
     await apiFetch('POST', `/autonomous/incidents/${encodeURIComponent(incidentId)}/approve`,
       { approved, user_id: 'user', comment: approved ? 'Approved via monitor' : 'Rejected via monitor' });
-    showToast(approved ? 'Fix approved' : 'Fix rejected');
+    showToast(approved ? '✓ Fix approved' : '✗ Fix rejected');
     await refreshAgentMonitor();
   } catch (e) {
+    if (row) row.querySelectorAll('button').forEach(b => b.disabled = false);
     showToast(e.message || 'Action failed', false);
   }
+}
+
+async function doApproveAll(approved) {
+  const ids = window._pendingApprovalIds || [];
+  if (ids.length === 0) return;
+  const word = approved ? 'Approve' : 'Reject';
+  if (!confirm(`${word} all ${ids.length} pending fix(es)?`)) return;
+
+  // Disable both bulk buttons
+  document.getElementById('am-approve-all-btn').disabled = true;
+  document.getElementById('am-reject-all-btn').disabled  = true;
+
+  let ok = 0, fail = 0;
+  for (const id of ids) {
+    const row = document.getElementById(`aprow-${id}`);
+    if (row) row.querySelectorAll('button').forEach(b => b.disabled = true);
+    try {
+      await apiFetch('POST', `/autonomous/incidents/${encodeURIComponent(id)}/approve`,
+        { approved, user_id: 'user', comment: approved ? 'Bulk approved via monitor' : 'Bulk rejected via monitor' });
+      ok++;
+    } catch (_) {
+      fail++;
+    }
+  }
+  showToast(
+    fail === 0
+      ? `${word}d ${ok} fix${ok !== 1 ? 'es' : ''}`
+      : `${ok} ${word.toLowerCase()}d, ${fail} failed`,
+    fail === 0,
+  );
+  await refreshAgentMonitor();
 }
 
 function gotoStatusFromAM(incidentId) {
