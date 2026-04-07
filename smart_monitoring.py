@@ -1112,6 +1112,11 @@ async def analyze_message(
     update_incident(incident_id, {"status": "RCA_IN_PROGRESS"})
     try:
         rca = await mcp.run_rca(incident)
+    except RuntimeError as exc:
+        # Agent not ready (MCP still connecting) → 503 so caller knows to retry
+        logger.warning(f"[SM] RCA blocked — agent not ready for {message_guid}: {exc}")
+        update_incident(incident_id, {"status": "RCA_FAILED"})
+        raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:
         logger.error(f"[SM] RCA failed for {message_guid}: {exc}")
         update_incident(incident_id, {"status": "RCA_FAILED"})

@@ -2761,6 +2761,12 @@ Return ONLY valid JSON (no markdown, no preamble):
   "affected_component": "<component name or step ID if identifiable>"
 }}
 """
+        if self.agent is None:
+            raise RuntimeError(
+                "MCP agent is not ready — SAP CPI MCP servers may still be connecting. "
+                "Wait a few seconds and retry."
+            )
+
         timestamp  = get_hana_timestamp()
         tracker    = TestExecutionTracker("system_rca", prompt, timestamp)
         logger_cb  = StepLogger(tracker)
