@@ -1938,36 +1938,33 @@ class MultiMCP:
                         "detail": {}
                     }
                 else:
-                    # Other error - verification inconclusive, assume exists
+                    # Non-404 error — cannot confirm iFlow exists; block fix to be safe
                     logger.info("=" * 80)
-                    logger.warning(f"[VERIFY] ⚠️  RESULT: VERIFICATION INCONCLUSIVE")
+                    logger.warning(f"[VERIFY] ⚠️  RESULT: VERIFICATION INCONCLUSIVE — BLOCKING FIX")
                     logger.warning(f"[VERIFY] iFlow ID: {iflow_id}")
-                    logger.warning(f"[VERIFY] Status: UNVERIFIED (assuming exists)")
+                    logger.warning(f"[VERIFY] Status: UNVERIFIED (treating as missing — will not proceed)")
                     logger.warning(f"[VERIFY] Error: {error_msg[:200]}")
-                    logger.warning(f"[VERIFY] Action: Proceeding with fix attempt")
                     logger.info("=" * 80)
-                    
+
                     return {
-                        "exists": True,
+                        "exists": False,
                         "verified": False,
                         "status_code": 0,
-                        "message": f"Could not verify iFlow existence: {error_msg[:200]}",
+                        "message": f"iFlow '{iflow_id}' existence could not be confirmed — fix blocked. Error: {error_msg[:200]}",
                         "detail": {}
                     }
         except Exception as e:
             logger.info("=" * 80)
-            logger.error(f"[VERIFY] ❌ EXCEPTION during verification")
+            logger.error(f"[VERIFY] ❌ EXCEPTION during verification — BLOCKING FIX")
             logger.error(f"[VERIFY] iFlow ID: {iflow_id}")
             logger.error(f"[VERIFY] Exception: {type(e).__name__}: {str(e)}")
-            logger.error(f"[VERIFY] Action: Assuming iFlow exists and proceeding")
             logger.info("=" * 80)
-            
-            # Network / auth errors don't confirm the iFlow is gone — assume it still exists.
+
             return {
-                "exists": True,
+                "exists": False,
                 "verified": False,
                 "status_code": 0,
-                "message": f"Error verifying iFlow: {str(e)}",
+                "message": f"iFlow '{iflow_id}' existence could not be verified due to an error — fix blocked. {type(e).__name__}: {str(e)}",
                 "detail": {}
             }
 
@@ -3340,12 +3337,14 @@ Do NOT call get-iflow. Do NOT modify the iFlow. Do NOT call deploy. Do NOT fetch
             logger.info(f"[FIX] Verifying iFlow existence before fix: {iflow_id}")
             existence_check = await self.verify_iflow_exists(iflow_id)
             
-            if not existence_check["exists"] and existence_check.get("verified", True):
-                logger.warning(f"[FIX] iFlow does not exist (deleted): {iflow_id}")
+            if not existence_check["exists"]:
+                confirmed = existence_check.get("verified", False)
+                logger.warning(f"[FIX] iFlow existence check failed ({'confirmed deleted' if confirmed else 'inconclusive — blocked'}): {iflow_id}")
                 final_status = "ARTIFACT_MISSING"
                 fix_summary = (
                     f"Cannot fix - iFlow '{iflow_id}' does not exist in SAP CPI. "
-                    f"The artifact may have been deleted. {existence_check['message']}"
+                    f"{'The artifact has been deleted.' if confirmed else 'Existence could not be confirmed — fix blocked as a precaution.'} "
+                    f"{existence_check['message']}"
                 )
 
                 update_incident(incident_id, {
@@ -3511,17 +3510,13 @@ Do NOT call get-iflow. Do NOT modify the iFlow. Do NOT call deploy. Do NOT fetch
         # ── Double-check iFlow existence right before fix (in case it was deleted during RCA) ──
         if iflow_id:
             existence_check = await self.verify_iflow_exists(iflow_id)
-            _confirmed_missing = not existence_check["exists"] and existence_check.get("verified", True)
-            if not existence_check.get("verified", True):
-                logger.warning(
-                    f"[FIX] iFlow existence re-check inconclusive (HTTP {existence_check['status_code']}), "
-                    f"proceeding with fix: {iflow_id}"
-                )
-            if _confirmed_missing:
-                logger.warning(f"[FIX] iFlow deleted during RCA phase: {iflow_id}")
+            if not existence_check["exists"]:
+                confirmed = existence_check.get("verified", False)
+                logger.warning(f"[FIX] iFlow existence check failed mid-fix ({'confirmed deleted' if confirmed else 'inconclusive — blocked'}): {iflow_id}")
                 final_status = "ARTIFACT_MISSING"
                 fix_summary = (
-                    f"Cannot fix - iFlow '{iflow_id}' was deleted during analysis. "
+                    f"Cannot fix - iFlow '{iflow_id}' "
+                    f"{'was deleted during analysis.' if confirmed else 'existence could not be confirmed mid-fix — blocked as a precaution.'} "
                     f"{existence_check['message']}"
                 )
                 self._set_progress(incident_id, "iFlow deleted - cannot fix", total, total, status=final_status)
