@@ -62,6 +62,34 @@
       width: 180px;
     }
 
+    /* ── Agent toggle ────────────────────────────────────── */
+    .agent-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-left: 16px;
+      padding-left: 16px;
+      border-left: 1px solid var(--border);
+    }
+    .agent-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--muted);
+      flex-shrink: 0;
+      transition: background .3s;
+    }
+    .agent-dot.running {
+      background: var(--success);
+      box-shadow: 0 0 6px var(--success);
+      animation: pulse 2s ease-in-out infinite;
+    }
+    .agent-dot.stopped { background: var(--danger); }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: .5; }
+    }
+    .agent-label { font-size: 11px; color: var(--text-sub); min-width: 54px; }
+
     /* ── Tabs ────────────────────────────────────────────── */
     nav.tabs {
       display: flex;
@@ -272,6 +300,85 @@
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: var(--surface); }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ── Agent Monitor page ───────────────────────────────── */
+    .agent-control-row {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+    .agent-big-dot {
+      width: 14px; height: 14px;
+      border-radius: 50%;
+      background: var(--muted);
+      flex-shrink: 0;
+      transition: background .3s;
+    }
+    .agent-big-dot.running {
+      background: var(--success);
+      box-shadow: 0 0 10px var(--success);
+      animation: pulse 2s ease-in-out infinite;
+    }
+    .agent-big-dot.stopped { background: var(--danger); }
+
+    .config-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .config-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+    .config-item .ci-label { font-size: 11px; color: var(--text-sub); margin-bottom: 4px; }
+    .config-item .ci-value { font-size: 14px; font-weight: 600; color: var(--text); }
+
+    .activity-feed { display: flex; flex-direction: column; gap: 8px; }
+    .activity-item {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 12px;
+      transition: border-color .15s;
+    }
+    .activity-item.is-active { border-color: var(--accent); }
+    .activity-item .ai-iflow  { color: var(--text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .activity-item .ai-cause  { font-size: 11px; color: var(--text-sub); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .activity-item .ai-time   { font-size: 11px; color: var(--muted); white-space: nowrap; }
+    .activity-item .ai-left   { min-width: 0; }
+
+    .approval-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 14px;
+      background: var(--surface);
+      border: 1px solid var(--warning);
+      border-radius: 8px;
+      font-size: 12px;
+    }
+    .approval-item .ap-info { flex: 1; min-width: 0; }
+    .approval-item .ap-iflow { font-weight: 600; color: var(--text); }
+    .approval-item .ap-fix   { color: var(--text-sub); font-size: 11px; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }
+    .section-header h2 { margin: 0; }
+    .refresh-note { font-size: 11px; color: var(--muted); }
+    .empty-state { text-align: center; padding: 28px; color: var(--muted); font-size: 13px; }
   </style>
 </head>
 <body>
@@ -285,6 +392,13 @@
   <div class="server-badge">
     API Base URL
     <input type="text" id="baseUrl" value="http://localhost:8080" />
+    <div class="agent-toggle">
+      <span class="agent-dot" id="agent-dot"></span>
+      <span class="agent-label" id="agent-label">—</span>
+      <button class="btn btn-sm btn-ghost" id="agent-toggle-btn" onclick="doAgentToggle()" disabled>
+        …
+      </button>
+    </div>
   </div>
 </header>
 
@@ -294,6 +408,7 @@
   <button onclick="switchTab('status', this)">📊 Fix Status</button>
   <button onclick="switchTab('retry', this)">🔁 Retry Fix</button>
   <button onclick="switchTab('tickets', this)">🎫 Tickets Created</button>
+  <button onclick="switchTab('agent', this)">🤖 Agent Monitor</button>
 </nav>
 
 <main>
@@ -561,6 +676,86 @@
     </div>
   </div>
 
+  <!-- ══════════════════════════════════════════════════════ -->
+  <!-- TAB 6 — AGENT MONITOR                                -->
+  <!-- ══════════════════════════════════════════════════════ -->
+  <div class="panel" id="panel-agent">
+
+    <!-- Control card -->
+    <div class="card">
+      <div class="section-header">
+        <h2>Autonomous Agent</h2>
+        <span id="am-refresh-note" class="refresh-note"></span>
+      </div>
+
+      <div class="agent-control-row">
+        <span class="agent-big-dot" id="am-dot"></span>
+        <div>
+          <div style="font-size:18px;font-weight:700;color:var(--text)" id="am-status-text">—</div>
+          <div style="font-size:12px;color:var(--text-sub);margin-top:2px" id="am-status-sub"></div>
+        </div>
+        <div class="actions" style="margin:0;margin-left:auto">
+          <button class="btn" id="am-toggle-btn" onclick="doAmToggle()" disabled style="min-width:130px">
+            <span id="am-toggle-spinner" class="spinner" style="display:none"></span>
+            <span id="am-toggle-label">…</span>
+          </button>
+          <button class="btn btn-ghost" onclick="doManualTrigger()" id="am-trigger-btn" title="Run one poll cycle now">
+            <span id="am-trigger-spinner" class="spinner" style="display:none"></span>
+            ⚡ Trigger Poll
+          </button>
+        </div>
+      </div>
+
+      <div class="config-grid" id="am-config-grid">
+        <div class="config-item"><div class="ci-label">Poll Interval</div><div class="ci-value" id="am-ci-poll">—</div></div>
+        <div class="config-item"><div class="ci-label">Auto-Fix Confidence</div><div class="ci-value" id="am-ci-autofix">—</div></div>
+        <div class="config-item"><div class="ci-label">Suggest Confidence</div><div class="ci-value" id="am-ci-suggest">—</div></div>
+        <div class="config-item"><div class="ci-label">Auto-Fix All Errors</div><div class="ci-value" id="am-ci-all">—</div></div>
+        <div class="config-item"><div class="ci-label">Auto Deploy</div><div class="ci-value" id="am-ci-deploy">—</div></div>
+      </div>
+    </div>
+
+    <!-- Pending Approvals -->
+    <div class="card" style="margin-top:20px">
+      <div class="section-header">
+        <h2>Pending Approvals</h2>
+        <span id="am-approval-count" class="refresh-note"></span>
+      </div>
+      <div id="am-approvals-list">
+        <div class="empty-state">No pending approvals.</div>
+      </div>
+    </div>
+
+    <!-- Live Activity Feed -->
+    <div class="card" style="margin-top:20px">
+      <div class="section-header">
+        <h2>Recent Activity</h2>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span id="am-last-refresh" class="refresh-note"></span>
+          <button class="btn btn-ghost btn-sm" onclick="refreshAgentMonitor()">↻ Refresh</button>
+        </div>
+      </div>
+
+      <!-- Active now section -->
+      <div id="am-active-section" style="display:none;margin-bottom:18px">
+        <div style="font-size:11px;font-weight:700;color:var(--accent2);letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px">
+          <span class="spinner" style="width:10px;height:10px;border-width:1.5px"></span>
+          &nbsp;In Progress
+        </div>
+        <div class="activity-feed" id="am-active-feed"></div>
+      </div>
+
+      <!-- All recent -->
+      <div style="font-size:11px;font-weight:700;color:var(--text-sub);letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px">
+        All Recent
+      </div>
+      <div class="activity-feed" id="am-all-feed">
+        <div class="empty-state">No incidents yet.</div>
+      </div>
+    </div>
+
+  </div>
+
 </main>
 
 <div id="toast"></div>
@@ -581,6 +776,12 @@ function switchTab(name, btn) {
   document.getElementById('panel-' + name).classList.add('active');
   btn.classList.add('active');
   if (name !== 'status') stopPoll();
+  if (name === 'agent') {
+    refreshAgentMonitor();
+    startAmPoll();
+  } else {
+    stopAmPoll();
+  }
 }
 
 function showToast(msg, ok = true) {
@@ -947,6 +1148,244 @@ function gotoStatusFromRetry() {
   switchTab('status', document.querySelectorAll('nav.tabs button')[2]);
   if (id) doStatus(true);
 }
+
+// ─── Agent Monitor ───────────────────────────────────────────────────────────
+let _amPollTimer   = null;
+let _amRunning     = null;
+
+const ACTIVE_STATUSES = new Set([
+  'RCA_IN_PROGRESS','FIX_IN_PROGRESS','FIX_DEPLOYED','DETECTED','AWAITING_APPROVAL'
+]);
+
+function startAmPoll() {
+  if (_amPollTimer) return;
+  _amPollTimer = setInterval(refreshAgentMonitor, 5000);
+}
+function stopAmPoll() {
+  if (_amPollTimer) { clearInterval(_amPollTimer); _amPollTimer = null; }
+}
+
+function _applyAmStatus(running) {
+  _amRunning = running;
+  const dot  = document.getElementById('am-dot');
+  const text = document.getElementById('am-status-text');
+  const sub  = document.getElementById('am-status-sub');
+  const btn  = document.getElementById('am-toggle-btn');
+  const lbl  = document.getElementById('am-toggle-label');
+  const note = document.getElementById('am-refresh-note');
+
+  dot.className = 'agent-big-dot ' + (running ? 'running' : 'stopped');
+  text.textContent = running ? 'Running' : 'Stopped';
+  text.style.color = running ? 'var(--success)' : 'var(--danger)';
+  sub.textContent  = running ? 'Monitoring SAP CPI for failed messages…' : 'Agent is idle — start it to begin monitoring.';
+  btn.className    = 'btn ' + (running ? 'btn-danger' : 'btn-success');
+  lbl.textContent  = running ? '⏹ Stop Agent' : '▶ Start Agent';
+  btn.disabled     = false;
+  note.textContent = running ? 'Auto-refreshing every 5s' : '';
+
+  // Keep header toggle in sync
+  _setAgentUI(running);
+}
+
+async function refreshAgentMonitor() {
+  try {
+    const [statusRes, incRes, approvalRes] = await Promise.all([
+      apiFetch('GET', '/autonomous/status'),
+      apiFetch('GET', '/autonomous/incidents?limit=30'),
+      apiFetch('GET', '/autonomous/pending_approvals').catch(() => ({ approvals: [] })),
+    ]);
+
+    _applyAmStatus(!!statusRes.running);
+
+    // Config tiles
+    document.getElementById('am-ci-poll').textContent    = (statusRes.poll_interval_seconds || '—') + 's';
+    document.getElementById('am-ci-autofix').textContent = statusRes.auto_fix_confidence != null
+      ? (statusRes.auto_fix_confidence * 100).toFixed(0) + '%' : '—';
+    document.getElementById('am-ci-suggest').textContent = statusRes.suggest_fix_confidence != null
+      ? (statusRes.suggest_fix_confidence * 100).toFixed(0) + '%' : '—';
+    document.getElementById('am-ci-all').textContent     = statusRes.auto_fix_all ? 'Yes' : 'No';
+    document.getElementById('am-ci-deploy').textContent  = statusRes.auto_deploy  ? 'Yes' : 'No';
+
+    // Incidents
+    const incidents = (incRes.incidents || []).slice().sort((a, b) =>
+      (b.last_seen || b.created_at || '').localeCompare(a.last_seen || a.created_at || '')
+    );
+    const active = incidents.filter(i => ACTIVE_STATUSES.has((i.status || '').toUpperCase()));
+    const all    = incidents;
+
+    // Active section
+    const activeSection = document.getElementById('am-active-section');
+    const activeFeed    = document.getElementById('am-active-feed');
+    if (active.length > 0) {
+      activeSection.style.display = 'block';
+      activeFeed.innerHTML = active.map(i => buildActivityItem(i, true)).join('');
+    } else {
+      activeSection.style.display = 'none';
+    }
+
+    // All feed
+    const allFeed = document.getElementById('am-all-feed');
+    if (all.length === 0) {
+      allFeed.innerHTML = '<div class="empty-state">No incidents recorded yet.</div>';
+    } else {
+      allFeed.innerHTML = all.map(i => buildActivityItem(i, false)).join('');
+    }
+
+    // Pending approvals
+    const approvals = approvalRes.approvals || approvalRes.pending_approvals || [];
+    const approvalList = document.getElementById('am-approvals-list');
+    document.getElementById('am-approval-count').textContent =
+      approvals.length ? `${approvals.length} waiting` : '';
+    if (approvals.length === 0) {
+      approvalList.innerHTML = '<div class="empty-state">No pending approvals.</div>';
+    } else {
+      approvalList.innerHTML = approvals.map(a => `
+        <div class="approval-item">
+          <span style="font-size:18px">⚠️</span>
+          <div class="ap-info">
+            <div class="ap-iflow">${escHtml(a.iflow_id || a.incident_id || '—')}</div>
+            <div class="ap-fix">${escHtml(a.proposed_fix || a.root_cause || 'Awaiting approval')}</div>
+          </div>
+          <div style="display:flex;gap:6px;flex-shrink:0">
+            <button class="btn btn-success btn-sm" onclick="doApprove('${escHtml(a.incident_id)}', true)">Approve</button>
+            <button class="btn btn-danger btn-sm"  onclick="doApprove('${escHtml(a.incident_id)}', false)">Reject</button>
+            <button class="btn btn-ghost btn-sm"   onclick="gotoStatusFromAM('${escHtml(a.incident_id)}')">→ Status</button>
+          </div>
+        </div>`).join('');
+    }
+
+    document.getElementById('am-last-refresh').textContent =
+      'Last updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById('am-status-text').textContent = 'Offline';
+    document.getElementById('am-status-sub').textContent  = e.message || 'Cannot reach server';
+  }
+}
+
+function buildActivityItem(inc, isActive) {
+  const status   = (inc.status || '').toUpperCase();
+  const timeStr  = (inc.last_seen || inc.created_at || '').replace('T', ' ').slice(0, 16);
+  const cause    = inc.root_cause || inc.error_type || '—';
+  const active   = isActive || ACTIVE_STATUSES.has(status);
+  return `
+    <div class="activity-item ${active ? 'is-active' : ''}"
+         onclick="gotoStatusFromAM('${escHtml(inc.incident_id || '')}')"
+         style="cursor:pointer" title="Click to view fix status">
+      <div class="ai-left">
+        <div class="ai-iflow">${escHtml(inc.iflow_id || inc.incident_id || '—')}</div>
+        <div class="ai-cause">${escHtml(cause.length > 90 ? cause.slice(0, 90) + '…' : cause)}</div>
+      </div>
+      ${pillFor(status)}
+      <span class="ai-time">${escHtml(timeStr)}</span>
+    </div>`;
+}
+
+async function doAmToggle() {
+  const btn = document.getElementById('am-toggle-btn');
+  btn.disabled = true;
+  setSpinner('am-toggle-spinner', true);
+  try {
+    if (_amRunning) {
+      await apiFetch('POST', '/autonomous/stop');
+      _applyAmStatus(false);
+      stopAmPoll();
+      showToast('Autonomous agent stopped');
+    } else {
+      await apiFetch('POST', '/autonomous/start');
+      _applyAmStatus(true);
+      startAmPoll();
+      showToast('Autonomous agent started');
+    }
+  } catch (e) {
+    showToast(e.message || 'Toggle failed', false);
+    btn.disabled = false;
+  } finally {
+    setSpinner('am-toggle-spinner', false);
+  }
+}
+
+async function doManualTrigger() {
+  const btn = document.getElementById('am-trigger-btn');
+  btn.disabled = true;
+  setSpinner('am-trigger-spinner', true);
+  try {
+    const d = await apiFetch('POST', '/autonomous/manual_trigger');
+    showToast(d.message || 'Poll triggered');
+    setTimeout(refreshAgentMonitor, 2000);
+  } catch (e) {
+    showToast(e.message || 'Trigger failed', false);
+  } finally {
+    btn.disabled = false;
+    setSpinner('am-trigger-spinner', false);
+  }
+}
+
+async function doApprove(incidentId, approved) {
+  try {
+    await apiFetch('POST', `/autonomous/incidents/${encodeURIComponent(incidentId)}/approve`,
+      { approved, user_id: 'user', comment: approved ? 'Approved via monitor' : 'Rejected via monitor' });
+    showToast(approved ? 'Fix approved' : 'Fix rejected');
+    await refreshAgentMonitor();
+  } catch (e) {
+    showToast(e.message || 'Action failed', false);
+  }
+}
+
+function gotoStatusFromAM(incidentId) {
+  if (!incidentId) return;
+  document.getElementById('st-id').value = incidentId;
+  switchTab('status', document.querySelectorAll('nav.tabs button')[2]);
+  doStatus(false);
+}
+
+// ─── Autonomous Agent Toggle ─────────────────────────────────────────────────
+let _agentRunning = null;
+
+function _setAgentUI(running) {
+  _agentRunning = running;
+  const dot   = document.getElementById('agent-dot');
+  const label = document.getElementById('agent-label');
+  const btn   = document.getElementById('agent-toggle-btn');
+  dot.className   = 'agent-dot ' + (running ? 'running' : 'stopped');
+  label.textContent = running ? 'Running' : 'Stopped';
+  btn.textContent   = running ? '⏹ Stop' : '▶ Start';
+  btn.className     = 'btn btn-sm ' + (running ? 'btn-danger' : 'btn-success');
+  btn.disabled      = false;
+}
+
+async function refreshAgentStatus() {
+  try {
+    const d = await apiFetch('GET', '/autonomous/status');
+    _setAgentUI(!!d.running);
+    // also prime the monitor page state without full refresh
+    _amRunning = !!d.running;
+  } catch {
+    document.getElementById('agent-label').textContent = 'offline';
+    document.getElementById('agent-toggle-btn').textContent = '?';
+  }
+}
+
+async function doAgentToggle() {
+  const btn = document.getElementById('agent-toggle-btn');
+  btn.disabled = true;
+  try {
+    if (_agentRunning) {
+      await apiFetch('POST', '/autonomous/stop');
+      _setAgentUI(false);
+      showToast('Autonomous agent stopped');
+    } else {
+      await apiFetch('POST', '/autonomous/start');
+      _setAgentUI(true);
+      showToast('Autonomous agent started');
+    }
+  } catch (e) {
+    showToast(e.message || 'Toggle failed', false);
+    btn.disabled = false;
+  }
+}
+
+// Init agent status on load
+window.addEventListener('DOMContentLoaded', refreshAgentStatus);
 </script>
 </body>
 </html>
