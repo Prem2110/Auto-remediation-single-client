@@ -478,14 +478,18 @@ YOU ARE A SAP CPI SELF-HEALING AGENT. Fix and deploy the broken iFlow described 
 === INCIDENT CONTEXT ===
 iFlow ID:          {iflow_id}
 Error Type:        {error_type}
+Message GUID:      {message_guid}
+Raw SAP Error:     {error_message}
 RCA — Root Cause:  {root_cause}
-RCA — Diagnosis:   {proposed_fix}
+RCA — Fix Spec:    {proposed_fix}
 Affected Component:{affected_component}
 {pattern_history}
 
-The RCA diagnosis above is a hint from automated analysis. You must read the actual iFlow first,
-understand its structure, and determine the precise XML change needed — do not blindly apply the
-diagnosis text as a literal instruction.
+IMPORTANT — "RCA — Fix Spec" is derived from automated analysis. It is a STARTING POINT, not
+a literal instruction. You MUST verify every field name, XPath expression, and namespace prefix
+against the actual iFlow XML and (for expression errors) the real message payload before writing
+any fix. Never output an expression containing "e.g." or placeholder names — use only confirmed,
+real values observed in the iFlow XML or message payload.
 
 === CRITICAL: SAP CLOUD INTEGRATION (IFLMAP) CONSTRAINTS ===
 This iFlow runs on SAP Cloud Integration (node type: IFLMAP), NOT on-premise SAP PI/PO.
@@ -539,7 +543,20 @@ STEP 1: Call get-iflow tool with iFlow ID: "{iflow_id}"
          d. Identify which specific component is most likely responsible for the error,
             based on the error type "{error_type}" and affected component "{affected_component}".
          e. Read that component's current configuration in the XML carefully.
-         Only proceed to STEP 2 after completing this analysis.
+         Only proceed to STEP 1.5 (or STEP 2 if skipped) after completing this analysis.
+
+STEP 1.5 — PAYLOAD INSPECTION (run this step if the error involves XPath, Groovy expressions,
+           field names, namespace prefixes, or data values; SKIP for pure config/URL/auth fixes):
+         Call get_message_logs ONCE with Message GUID: "{message_guid}"
+         From the log output:
+         a. Identify the actual XML/JSON structure of the message at the failing step.
+         b. Confirm which field names and namespace prefixes exist in the real payload.
+         c. Use ONLY confirmed field names and namespaces when writing any XPath, Groovy,
+            or expression — never guess or use names from the RCA Fix Spec without verifying.
+         d. If get_message_logs returns no payload content (e.g. message already gone),
+            proceed to STEP 2 using only the iFlow XML structure as reference.
+         SKIP this step entirely for errors that are pure adapter config changes
+         (wrong URL, wrong HTTP method, missing auth header, wrong Content-Type).
 
 STEP 2: Based on your iFlow analysis from STEP 1 and the RCA diagnosis above,
          determine the minimal, precise XML change needed to fix the error.
@@ -580,7 +597,7 @@ STEP 3: Call deploy-iflow tool with iFlow ID: "{iflow_id}"
 
 === STRICT RULES ===
 - Do NOT skip any step.
-- Do NOT call get_message_logs during this fix.
+- Call get_message_logs AT MOST ONCE and ONLY in STEP 1.5. Do not call it again later.
 - Do NOT modify any other iFlow.
 - Do NOT ask for confirmation — execute all steps automatically.
 - After step 3, return this EXACT JSON (no markdown, no extra text):
@@ -2329,6 +2346,7 @@ Execution policy:
         session_id: str,
         timestamp: str,
         progress_fn=None,
+        message_guid: str = "",
     ) -> Dict[str, Any]:
         """
         Builds a strict fix+deploy prompt and invokes the agent.
@@ -2362,7 +2380,7 @@ Execution policy:
         tracker   = TestExecutionTracker(user_id, f"fix:{iflow_id}", timestamp)
         logger_cb = StepLogger(tracker, progress_fn=progress_fn)
 
-        sig = self.error_signature(iflow_id, error_type or "UNKNOWN")
+        sig = self.error_signature(iflow_id, error_type or "UNKNOWN", error_message)
         patterns = get_similar_patterns(sig)
         if patterns:
             best = patterns[0]
@@ -2380,6 +2398,8 @@ Execution policy:
         prompt = FIX_AND_DEPLOY_PROMPT_TEMPLATE.format(
             iflow_id=iflow_id,
             error_type=error_type or "UNKNOWN",
+            error_message=(error_message or "")[:500],
+            message_guid=message_guid or "N/A",
             root_cause=root_cause or error_message,
             proposed_fix=proposed_fix or f"Investigate and fix the error: {error_message}",
             affected_component=affected_component or "unknown",
@@ -2622,46 +2642,82 @@ Execution policy:
     @staticmethod
     def classify_error(error_message: str) -> Dict:
         msg = (error_message or "").lower()
-        if any(k in msg for k in ["mandatory", "required field", "null value",
-                                   "validation failed", "data validation"]):
-            return {"error_type": "DATA_VALIDATION",    "confidence": 0.85, "tags": ["validation","data"]}
-        if any(k in msg for k in ["mappingexception", "does not exist in target",
-                                   "target structure", "mapping runtime"]):
-            return {"error_type": "MAPPING_ERROR",      "confidence": 0.88, "tags": ["mapping","schema"]}
-        # SFTP errors — requires server-side action, not iFlow config change.
-        # Auth failures on SFTP are also server/credential issues — caught here before AUTH_ERROR.
-        if any(k in msg for k in ["no such file", "no such directory", "sftp",
-                                   "permission denied", "sshexception", "jsch",
-                                   "failed to connect sftp", "cannot open channel",
-                                   "auth fail", "authentication failed", "publickey",
-                                   "hostkey", "known hosts", "host key",
+
+        # ── SFTP — must come before AUTH_ERROR; SFTP auth failures are server-side ──
+        if any(k in msg for k in ["sftp", "sshexception", "jsch", "failed to connect sftp",
+                                   "cannot open channel", "publickey", "hostkey",
+                                   "known hosts", "host key", "no such file", "no such directory",
                                    "file already exists", "quota exceeded", "no space left"]):
-            return {"error_type": "SFTP_ERROR",         "confidence": 0.93, "tags": ["sftp","filesystem"]}
-        if any(k in msg for k in ["connection refused", "connect timed out",
-                                   "unreachable", "socketexception"]):
-            return {"error_type": "CONNECTIVITY_ERROR", "confidence": 0.90, "tags": ["network","timeout"]}
-        if any(k in msg for k in ["401","403","unauthorized","expired",
-                                   "certificate","ssl","tls"]):
-            return {"error_type": "AUTH_ERROR",         "confidence": 0.92, "tags": ["auth","cert"]}
-        # 5xx — backend is at fault; iFlow cannot fix a server-side error
-        if any(k in msg for k in ["503", "service unavailable", "502", "bad gateway"]):
-            return {"error_type": "BACKEND_ERROR",         "confidence": 0.85, "tags": ["backend","5xx"]}
-        if any(k in msg for k in ["500", "internal server error", "backend"]):
-            return {"error_type": "BACKEND_ERROR",         "confidence": 0.82, "tags": ["backend","500"]}
-        # 4xx — iFlow sent a bad request; fix the adapter config
+            return {"error_type": "SFTP_ERROR",            "confidence": 0.93, "tags": ["sftp","filesystem"]}
+        if "permission denied" in msg and any(k in msg for k in ["sftp", "ssh", "ftp"]):
+            return {"error_type": "SFTP_ERROR",            "confidence": 0.92, "tags": ["sftp","filesystem"]}
+
+        # ── Explicit auth/cert signals — must come before numeric HTTP code checks ──
+        if any(k in msg for k in ["unauthorized", "invalid credentials", "credential",
+                                   "certificate", "ssl handshake", "tls handshake",
+                                   "token expired", "access token", "oauth"]):
+            return {"error_type": "AUTH_ERROR",            "confidence": 0.93, "tags": ["auth","cert"]}
+        if any(k in msg for k in ["401", "403"]) and not any(k in msg for k in ["sftp", "ssh"]):
+            return {"error_type": "AUTH_ERROR",            "confidence": 0.91, "tags": ["auth","cert"]}
+
+        # ── Mapping / schema — specific exceptions before generic "field"/"mapping" ──
+        if any(k in msg for k in ["mappingexception", "does not exist in target",
+                                   "target structure", "mapping runtime",
+                                   "xpath", "namespace", "xslt", "transformation failed"]):
+            return {"error_type": "MAPPING_ERROR",         "confidence": 0.90, "tags": ["mapping","schema"]}
+
+        # ── Data validation ──
+        if any(k in msg for k in ["mandatory", "required field", "null value",
+                                   "validation failed", "data validation",
+                                   "schema validation", "invalid payload"]):
+            return {"error_type": "DATA_VALIDATION",       "confidence": 0.87, "tags": ["validation","data"]}
+
+        # ── Connectivity / network ──
+        if any(k in msg for k in ["connection refused", "connect timed out", "read timed out",
+                                   "unreachable", "socketexception", "network unreachable",
+                                   "dns resolution", "no route to host"]):
+            return {"error_type": "CONNECTIVITY_ERROR",    "confidence": 0.90, "tags": ["network","timeout"]}
+
+        # ── Rate limiting — transient; retry, not an iFlow fix ──
+        if any(k in msg for k in ["429", "too many requests", "rate limit", "rate limited",
+                                   "throttl"]):
+            return {"error_type": "CONNECTIVITY_ERROR",    "confidence": 0.82, "tags": ["network","ratelimit"]}
+
+        # ── 5xx backend errors — server-side, iFlow cannot fix ──
+        if any(k in msg for k in ["503", "service unavailable", "502", "bad gateway",
+                                   "504", "gateway timeout"]):
+            return {"error_type": "BACKEND_ERROR",         "confidence": 0.87, "tags": ["backend","5xx"]}
+        if any(k in msg for k in ["500", "internal server error"]):
+            return {"error_type": "BACKEND_ERROR",         "confidence": 0.83, "tags": ["backend","500"]}
+
+        # ── 4xx adapter config errors — iFlow sent a bad request ──
         if any(k in msg for k in ["400", "bad request", "404", "not found",
-                                   "422", "unprocessable", "405", "method not allowed"]):
-            return {"error_type": "ADAPTER_CONFIG_ERROR",  "confidence": 0.82, "tags": ["adapter","4xx"]}
-        # 429 — rate limiting is transient; retry
-        if any(k in msg for k in ["429", "too many requests", "rate limit", "rate limited"]):
-            return {"error_type": "CONNECTIVITY_ERROR",    "confidence": 0.80, "tags": ["network","ratelimit"]}
-        if any(k in msg for k in ["field", "mapping"]):
-            return {"error_type": "MAPPING_ERROR",      "confidence": 0.75, "tags": ["mapping","schema"]}
-        return {"error_type": "UNKNOWN_ERROR",          "confidence": 0.50, "tags": []}
+                                   "422", "unprocessable", "405", "method not allowed",
+                                   "406", "415", "unsupported media type"]):
+            return {"error_type": "ADAPTER_CONFIG_ERROR",  "confidence": 0.83, "tags": ["adapter","4xx"]}
+
+        # ── Weak signals — broad keywords last to avoid false positives ──
+        if any(k in msg for k in ["mapping", "field", "structure"]):
+            return {"error_type": "MAPPING_ERROR",         "confidence": 0.72, "tags": ["mapping","schema"]}
+        if any(k in msg for k in ["expired", "ssl", "tls"]):
+            return {"error_type": "AUTH_ERROR",            "confidence": 0.70, "tags": ["auth","cert"]}
+
+        return {"error_type": "UNKNOWN_ERROR",             "confidence": 0.50, "tags": []}
 
     @staticmethod
-    def error_signature(iflow_id: str, error_type: str) -> str:
-        return hashlib.md5(f"{iflow_id}:{error_type}".encode()).hexdigest()[:16]
+    def error_signature(iflow_id: str, error_type: str, error_message: str = "") -> str:
+        # Strip GUIDs, timestamps, and numeric IDs from the message so the same
+        # logical error always produces the same signature even with different IDs.
+        import re as _re
+        clean = _re.sub(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"  # UUID
+            r"|[A-Z0-9]{20,}"           # long message GUIDs / IDs
+            r"|\b\d{4,}\b"             # standalone 4+ digit numbers
+            r"|[\s]+",                  # collapse whitespace
+            " ",
+            (error_message or "").lower(),
+        ).strip()[:60]
+        return hashlib.md5(f"{iflow_id}:{error_type}:{clean}".encode()).hexdigest()[:16]
 
     @staticmethod
     def fallback_root_cause(error_type: str, error_message: str) -> str:
@@ -2700,20 +2756,38 @@ Execution policy:
         message_guid  = incident.get("message_guid", "")
         error_type    = incident.get("error_type", "UNKNOWN")
 
-        sig      = self.error_signature(iflow_id, error_type)
+        sig      = self.error_signature(iflow_id, error_type, error_message)
         patterns = get_similar_patterns(sig)
         history_hint = ""
         if patterns:
-            history_hint = f"\n\nHistorical fix patterns:\n{json.dumps(patterns, indent=2)}"
+            # Include key_steps from successful fixes so RCA knows exactly what worked before
+            compact = []
+            for p in patterns:
+                entry = {
+                    "fix_applied":  p.get("fix_applied", ""),
+                    "root_cause":   p.get("root_cause", ""),
+                    "success_rate": round(
+                        (p.get("success_count") or 0) / max(p.get("applied_count") or 1, 1), 2
+                    ),
+                }
+                if p.get("key_steps"):
+                    try:
+                        entry["key_steps"] = json.loads(p["key_steps"])
+                    except Exception:
+                        entry["key_steps"] = p["key_steps"]
+                compact.append(entry)
+            history_hint = f"\n\nHistorical fix patterns (ranked by success rate):\n{json.dumps(compact, indent=2)}"
         
         # Retrieve relevant SAP notes from vector store
         vector_store = get_vector_store()
-        sap_notes = vector_store.retrieve_relevant_notes(error_message, error_type, iflow_id, limit=3)
+        sap_notes = vector_store.retrieve_relevant_notes(error_message, error_type, iflow_id, limit=5)
         sap_notes_context = vector_store.format_notes_for_prompt(sap_notes)
+
+        iflow_hint = f"- iFlow ID for config lookup: {iflow_id}" if iflow_id else ""
 
         if message_guid:
             prompt = f"""
-AUTONOMOUS RCA — do NOT ask for human input. Maximum 3 tool calls total.
+AUTONOMOUS RCA — do NOT ask for human input. Maximum 4 tool calls total.
 
 Error detected:
 - iFlow:      {iflow_id}
@@ -2723,18 +2797,19 @@ Error detected:
 {history_hint}
 {sap_notes_context}
 
-Steps (execute in order, stop after step 2):
+Steps (execute in order, stop after step 3):
 1. Call get_message_logs ONCE for message ID: {message_guid}
-2. Analyse root cause and propose a specific fix based on the logs
+2. Call get-iflow ONCE for iFlow ID: {iflow_id} — read the actual configuration to pinpoint which step/adapter/mapping is misconfigured
+3. Cross-reference the log error with the iFlow configuration and produce a precise diagnosis
 
 Return ONLY valid JSON (no markdown, no preamble):
 {{
-  "root_cause": "<clear description of what went wrong and why>",
-  "proposed_fix": "<conceptual diagnosis: what type of problem this is and what category of change is needed — e.g. 'XPath expression uses namespace prefix d: but no namespace is declared', 'SFTP directory path does not exist on the target server', 'Content Modifier header srcType is set to Constant instead of Expression'. Do NOT write XML editing instructions — the fix agent will read the iFlow and determine the exact change.>",
+  "root_cause": "<clear description referencing the specific iFlow step, adapter, or mapping that is wrong and why>",
+  "proposed_fix": "<precise diagnosis grounded in the actual iFlow config — e.g. 'XPath expression /ns1:Order uses prefix ns1 but namespace is not declared in the Message Mapping step MM_OrderTransform', 'Receiver HTTP adapter in step CallStripe has URL path /v1/charges but the Stripe API expects /v1/payment_intents', 'Content Modifier step SetHeader has srcType=Constant but the value references a property that must use Expression type'. Do NOT write XML — the fix agent applies the change.>",
   "confidence": 0.0,
   "auto_apply": false,
   "error_type": "<error type>",
-  "affected_component": "<component name or step ID if identifiable from logs>"
+  "affected_component": "<exact step ID or adapter name from the iFlow config>"
 }}
 
 STOP after returning JSON. Do not call any other tools.
@@ -2742,23 +2817,27 @@ STOP after returning JSON. Do not call any other tools.
         else:
             prompt = f"""
 AUTONOMOUS RCA — do NOT ask for human input. No message GUID is available.
-Base the RCA only on the runtime artifact/deployment error context below. Do not call tools.
+{iflow_hint}
+{history_hint}
+{sap_notes_context}
 
 Error detected:
 - iFlow:      {iflow_id}
 - Error Type: {error_type}
 - Message:    {error_message}
-{history_hint}
-{sap_notes_context}
+
+Steps (execute in order, stop after step 2):
+1. Call get-iflow ONCE for iFlow ID: {iflow_id} — read the actual configuration to identify the misconfigured step
+2. Produce a precise diagnosis based on the iFlow config and the error above
 
 Return ONLY valid JSON (no markdown, no preamble):
 {{
-  "root_cause": "<clear description of what went wrong and why>",
-  "proposed_fix": "<conceptual diagnosis: what type of problem this is and what category of change is needed — e.g. 'XPath expression uses namespace prefix but no namespace is declared', 'SFTP directory path does not exist', 'adapter version exceeds platform limit'. Do NOT write XML editing instructions — the fix agent will read the iFlow and determine the exact change.>",
+  "root_cause": "<clear description referencing the specific step or adapter that is wrong and why>",
+  "proposed_fix": "<precise diagnosis grounded in the actual iFlow config — name the exact step/adapter and what is wrong. Do NOT write XML — the fix agent applies the change.>",
   "confidence": 0.0,
   "auto_apply": false,
   "error_type": "<error type>",
-  "affected_component": "<component name or step ID if identifiable>"
+  "affected_component": "<exact step ID or adapter name from the iFlow config>"
 }}
 """
         if self.agent is None:
@@ -2898,6 +2977,7 @@ Return ONLY valid JSON (no markdown, no preamble):
             session_id=f"autofix_{incident.get('incident_id', 'unknown')}",
             timestamp=get_hana_timestamp(),
             progress_fn=progress_fn,
+            message_guid=incident.get("message_guid", ""),
         )
         return result
 
@@ -3120,12 +3200,13 @@ Do NOT call get-iflow. Do NOT modify the iFlow. Do NOT call deploy. Do NOT fetch
                 "verification_status": "VERIFIED" if _resolved else "PENDING",
             })
             upsert_fix_pattern({
-                "error_signature": self.error_signature(incident["iflow_id"], rca.get("error_type","")),
+                "error_signature": self.error_signature(incident["iflow_id"], rca.get("error_type",""), incident.get("error_message","")),
                 "iflow_id":        incident["iflow_id"],
                 "error_type":      rca.get("error_type",""),
                 "root_cause":      rca.get("root_cause",""),
                 "fix_applied":     rca.get("proposed_fix",""),
                 "outcome":         outcome,
+                "key_steps":       fix_result.get("steps", []) if fix_result.get("success") else [],
             })
             return final_status
 
@@ -3391,7 +3472,7 @@ Do NOT call get-iflow. Do NOT modify the iFlow. Do NOT call deploy. Do NOT fetch
         }
 
         # ── Pattern-first: apply proven fix directly, skip RCA if high-confidence pattern exists ──
-        _sig = self.error_signature(iflow_id, working_incident.get("error_type", ""))
+        _sig = self.error_signature(iflow_id, working_incident.get("error_type", ""), working_incident.get("error_message", ""))
         _patterns = get_similar_patterns(_sig)
         _best_pattern = next(
             (p for p in _patterns
@@ -3679,12 +3760,13 @@ Do NOT call get-iflow. Do NOT modify the iFlow. Do NOT call deploy. Do NOT fetch
         })
         upsert_fix_pattern(
             {
-                "error_signature": self.error_signature(working_incident.get("iflow_id", ""), rca.get("error_type", "")),
-                "iflow_id": working_incident.get("iflow_id", ""),
+                "error_signature": self.error_signature(working_incident.get("iflow_id", ""), rca.get("error_type", ""), working_incident.get("error_message", "")),
+                "iflow_id":   working_incident.get("iflow_id", ""),
                 "error_type": rca.get("error_type", ""),
                 "root_cause": rca.get("root_cause", ""),
                 "fix_applied": rca.get("proposed_fix", ""),
-                "outcome": "SUCCESS" if fix_result.get("success") else "FAILED",
+                "outcome":    "SUCCESS" if fix_result.get("success") else "FAILED",
+                "key_steps":  fix_result.get("steps", []) if fix_result.get("success") else [],
             },
             replay_success=replay_success,
         )
@@ -4564,7 +4646,7 @@ async def get_fix_patterns(incident_id: str):
     incident = _resolve_incident_reference(incident_id)
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
-    sig      = MultiMCP.error_signature(incident.get("iflow_id", ""), incident.get("error_type", ""))
+    sig      = MultiMCP.error_signature(incident.get("iflow_id", ""), incident.get("error_type", ""), incident.get("error_message", ""))
     patterns = get_similar_patterns(sig)
     return {"patterns": patterns, "signature": sig}
 

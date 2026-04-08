@@ -36,7 +36,7 @@ API docs: `http://localhost:8080/docs`
 ### Core Capabilities
 
 - **Autonomous Error Detection** — Continuously polls SAP CPI for failed messages and runtime artifact errors
-- **AI Root Cause Analysis (RCA)** — LangChain agent analyses errors using message logs, SAP notes from vector store, HANA knowledge base, and rule-based classifier
+- **AI Root Cause Analysis (RCA)** — LangChain agent analyses errors using message logs, actual iFlow configuration (`get-iflow`), top-5 SAP notes from vector store, HANA knowledge base, and rule-based classifier with priority-ordered keyword matching
 - **Self-Healing Fix Pipeline** — Downloads iFlow config, reads and understands every iFlow component (name, purpose, steps, adapters), applies a reasoned fix, updates and deploys — with automatic unlock handling, 600 s agent timeout, per-stage failure diagnosis, and retry logic
 - **Pre-Update XML Validator** — Python validator intercepts every `update-iflow` call before it reaches SAP CPI: checks filepath matches the original, validates XML is well-formed, rejects `ifl:property` at collaboration level, and blocks version attribute changes. Validation errors are returned to the LLM as specific actionable messages so it can self-correct in the same run
 - **SFTP Error Routing** — All SFTP-class errors (`no such file`, `permission denied`, `auth fail`, `hostkey`, `jsch`, quota exceeded, etc.) are classified as `SFTP_ERROR` and routed directly to `TICKET_CREATED` — the agent never wastes a fix attempt on errors that require server-side action
@@ -49,9 +49,10 @@ API docs: `http://localhost:8080/docs`
 - **Smart Monitoring API** — Full REST backend for real-time monitoring UI (incidents, drill-down, apply fix, retry messages)
 - **Dashboard API** — KPI cards, charts, leaderboards, and drill-downs for analytics dashboard
 - **Conversational Chatbot** — Natural language interface; detects fix intent and triggers full RCA → fix → deploy pipeline automatically
-- **Fix Pattern Learning** — Successful fixes are stored and reused for recurring errors via error signature matching
+- **Fix Pattern Learning** — Successful fixes are stored and reused for recurring errors via error signature matching (scoped to iflow + error type + normalised error message fragment). History hints now include `success_rate` and `key_steps` per pattern
 - **Live Fix Progress** — In-memory step tracker (FIX_PROGRESS store) provides granular pipeline progress without HANA polling
 - **Runtime Configuration** — Toggle auto-fix enabled/disabled via API without service restart
+- **Bulk Approval UI** — Agent Monitor UI supports Approve All / Reject All for all pending incidents, plus individual per-row approve/reject buttons with immediate button disabling to prevent double-submission
 - **Locked Artifact Handling** — Automatic unlock attempts via multiple API methods before fix application
 - **Recurring Incident Correlation** — Deduplicates errors by signature and resumes fix flow for recurring failures
 - **Background Task Processing** — Non-blocking fix application and RCA execution via FastAPI background tasks
@@ -370,14 +371,18 @@ auto-remediation/
 Error detected
       │
       ├─── LangChain Agent                   ├─── Rule-based Classifier
-      │    • Calls get_message_logs            │    • Keyword matching on error text
-      │    • Retrieves SAP notes from vector   │    • Returns error_type + confidence
-      │      store (HANA SAP_HELP_DOCS)        │
-      │    • Produces conceptual diagnosis     │
-      │      (what type of problem, not XML    │
-      │       instructions)                   │
-      │    • Returns confidence score          │
-      │                                        │
+      │    • Calls get_message_logs            │    • Priority-ordered keyword matching
+      │    • Calls get-iflow (reads actual     │      (SFTP → auth → mapping → data
+      │      iFlow configuration)             │       validation → connectivity →
+      │    • Retrieves top-5 SAP notes from   │       rate-limit → 5xx → 4xx →
+      │      vector store (HANA SAP_HELP_DOCS)│       weak signals)
+      │    • Checks historical fix patterns   │    • Returns error_type + confidence
+      │      with success_rate + key_steps    │
+      │    • Produces conceptual diagnosis    │
+      │      (what type of problem, not XML   │
+      │       instructions)                  │
+      │    • Returns confidence score         │
+      │                                       │
       └─────────── max(LLM_conf, classifier_conf) ── final_confidence
                                     │
                     If proposed_fix empty → use FALLBACK_FIX_BY_ERROR_TYPE
@@ -386,10 +391,18 @@ Error detected
 **RCA output (`proposed_fix`) is a conceptual diagnosis**, not XML editing instructions — e.g. *"XPath expression uses namespace prefix `d:` but no namespace is declared"*. The fix agent reads the actual iFlow and determines the precise XML change itself.
 
 **Vector Store Integration:**
-- Retrieves top 5 relevant SAP notes from `SAP_HELP_DOCS` table (20,000+ notes)
+- Retrieves top **5** relevant SAP notes from `SAP_HELP_DOCS` table (20,000+ notes)
 - Uses cosine similarity search on 3072-dim embeddings (text-embedding-3-large via AI Core)
 - Falls back to HANA full-text fuzzy search if vector search returns no results
 - Enriches RCA prompt with SAP Note content and fix guidance
+
+**Historical Pattern Context:**
+- `error_signature` is scoped to `iflow_id + error_type + normalised error message fragment` (strips GUIDs, long hex codes, large numbers) — prevents unrelated errors on the same iFlow from sharing fix history
+- History hints include `success_rate` (successes / total applications) and `key_steps` (step-level detail from successful fixes) so the LLM can reproduce proven solutions precisely
+
+**Agent-Not-Ready Guard:**
+- If the LangChain agent is still initialising (MCP servers connecting at startup), `run_rca()` raises `RuntimeError` immediately instead of proceeding
+- `/smart-monitoring/messages/{guid}/analyze` returns **HTTP 503** (not 200) in this case, with a human-readable message to retry after a few seconds
 
 ### Remediation Gate
 
@@ -447,16 +460,19 @@ Error detected
 
 ### Error Classification
 
-| Error Type | Default Action | Auto-replay | Keywords |
-|---|---|---|---|
-| `MAPPING_ERROR` | AUTO_FIX | Yes | `mappingexception`, `does not exist in target`, `target structure` |
-| `DATA_VALIDATION` | AUTO_FIX | Yes | `mandatory`, `required field`, `null value`, `validation failed` |
-| `AUTH_ERROR` | AUTO_FIX | Yes | `401`, `403`, `unauthorized`, `expired`, `certificate`, `ssl`, `tls` |
-| `CONNECTIVITY_ERROR` | RETRY | Yes | `connection refused`, `connect timed out`, `unreachable`, `socketexception`, `429`, `too many requests`, `rate limit` |
-| `ADAPTER_CONFIG_ERROR` | AUTO_FIX | Yes | `400`, `bad request`, `404`, `not found`, `422`, `unprocessable`, `405`, `method not allowed` |
-| `BACKEND_ERROR` | TICKET_CREATED | No | `500`, `internal server error`, `502`, `bad gateway`, `503`, `service unavailable`, `backend` |
-| `SFTP_ERROR` | TICKET_CREATED | No | `no such file`, `no such directory`, `sftp`, `permission denied`, `jsch`, `sshexception`, `auth fail`, `authentication failed`, `publickey`, `hostkey`, `known hosts`, `file already exists`, `quota exceeded`, `no space left` |
-| `UNKNOWN_ERROR` | PENDING_APPROVAL | No | _(fallback)_ |
+Classifier uses **priority-ordered** matching — first match wins. Order prevents overlap between high-specificity patterns (e.g. SFTP) and low-specificity patterns (e.g. bare `401`/`403`).
+
+| Priority | Error Type | Default Action | Auto-replay | Keywords |
+|---|---|---|---|---|
+| 1 | `SFTP_ERROR` | TICKET_CREATED | No | `no such file`, `no such directory`, `sftp`, `permission denied`, `jsch`, `sshexception`, `auth fail`, `authentication failed`, `publickey`, `hostkey`, `known hosts`, `file already exists`, `quota exceeded`, `no space left` |
+| 2 | `AUTH_ERROR` | AUTO_FIX | Yes | `unauthorized`, `expired`, `certificate`, `ssl handshake`, `tls`, `saml`, `oauth` (explicit auth keywords only — does **not** match bare `401`/`403`) |
+| 3 | `MAPPING_ERROR` | AUTO_FIX | Yes | `mappingexception`, `does not exist in target`, `target structure`, `xslt`, `groovy`, `script` |
+| 4 | `DATA_VALIDATION` | AUTO_FIX | Yes | `mandatory`, `required field`, `null value`, `validation failed`, `schema validation` |
+| 5 | `CONNECTIVITY_ERROR` | RETRY | Yes | `connection refused`, `connect timed out`, `unreachable`, `socketexception`, `network`, `dns` |
+| 6 | `CONNECTIVITY_ERROR` (rate-limit) | RETRY | Yes | `429`, `too many requests`, `rate limit`, `throttl` |
+| 7 | `BACKEND_ERROR` | TICKET_CREATED | No | `500`, `internal server error`, `502`, `bad gateway`, `503`, `service unavailable`, `backend` |
+| 8 | `ADAPTER_CONFIG_ERROR` | AUTO_FIX | Yes | `400`, `bad request`, `401`, `403`, `404`, `not found`, `422`, `unprocessable`, `405`, `method not allowed` |
+| 9 | `UNKNOWN_ERROR` | PENDING_APPROVAL | No | _(fallback)_ |
 
 **Error type rationale:**
 
@@ -536,7 +552,7 @@ Direct API for fixing and deploying an iFlow without requiring an existing incid
 | `GET` | `/smart-monitoring/messages` | List failed CPI messages with filters |
 | `GET` | `/smart-monitoring/messages/paginated` | Paginated failed messages |
 | `GET` | `/smart-monitoring/messages/{guid}` | Full detail (6 tabs) for one message |
-| `POST` | `/smart-monitoring/messages/{guid}/analyze` | Trigger AI RCA |
+| `POST` | `/smart-monitoring/messages/{guid}/analyze` | Trigger AI RCA — returns `503` if MCP agent is still initialising |
 | `POST` | `/smart-monitoring/messages/{guid}/generate_fix_patch` | Generate fix plan |
 | `POST` | `/smart-monitoring/messages/{guid}/apply_fix` | Apply and deploy fix |
 | `POST` | `/smart-monitoring/incidents/{id}/retry_fix` | Retry a previously failed fix (up to 3 attempts) |
@@ -737,6 +753,10 @@ curl -X POST http://localhost:8080/autonomous/incidents/{id}/approve \
   -H "Content-Type: application/json" \
   -d '{"approved": true, "user_id": "user@example.com"}'
 ```
+
+**Bulk approve / reject all pending fixes (UI Approve All / Reject All):**
+
+The Agent Monitor UI issues individual `POST /autonomous/incidents/{id}/approve` calls sequentially for each pending incident. There is no dedicated bulk endpoint — the UI iterates through `window._pendingApprovalIds` and calls approve/reject per incident, then shows an ok/fail count toast.
 
 **Manually trigger one-shot polling (without starting the loop):**
 ```bash
@@ -993,9 +1013,12 @@ CREATE TABLE fix_patterns (
     last_seen             NVARCHAR(64),
     -- migration columns (added via ALTER TABLE on startup if missing)
     success_count         INTEGER DEFAULT 0,
-    replay_success_count  INTEGER DEFAULT 0
+    replay_success_count  INTEGER DEFAULT 0,
+    key_steps             NVARCHAR(2000)   -- JSON array of fix steps from successful runs
 );
 ```
+
+`key_steps` stores up to 8 step descriptions (200 chars each) from the most recent successful fix. Only written when `outcome = SUCCESS`. Surfaced in the history hint passed to the RCA prompt so the LLM can reproduce proven solutions step-by-step. The `error_signature` hash is now scoped to `iflow_id + error_type + normalised_error_fragment` (strips GUIDs, long hex codes, large numbers) to prevent unrelated errors on the same iFlow from polluting each other's pattern history.
 
 #### `MCP_QUERY_HISTORY`
 

@@ -127,8 +127,12 @@ def _get_autonomous_incident_column_lookup() -> Dict[str, str]:
 
 
 def ensure_fix_patterns_schema():
-    """Add success_count and replay_success_count columns to fix_patterns if missing."""
-    required = {"success_count": "INTEGER", "replay_success_count": "INTEGER"}
+    """Add missing columns to fix_patterns if absent."""
+    required = {
+        "success_count":        "INTEGER",
+        "replay_success_count": "INTEGER",
+        "key_steps":            "NVARCHAR(2000)",  # JSON array of step descriptions from successful fix
+    }
     try:
         conn = get_connection()
         cur  = conn.cursor()
@@ -138,7 +142,8 @@ def ensure_fix_patterns_schema():
         existing = {str(r[0]).lower() for r in cur.fetchall()}
         for col, typ in required.items():
             if col.lower() not in existing:
-                cur.execute(f'ALTER TABLE fix_patterns ADD ("{col}" {typ} DEFAULT 0)')
+                default = " DEFAULT 0" if "INTEGER" in typ else ""
+                cur.execute(f'ALTER TABLE fix_patterns ADD ("{col}" {typ}{default})')
         conn.commit()
         conn.close()
     except Exception as e:
@@ -638,14 +643,21 @@ def get_pending_approvals() -> List[Dict]:
 
 def upsert_fix_pattern(data: Dict, replay_success: bool = False):
     try:
+        import json as _json
         conn = get_connection()
         cur  = conn.cursor()
         sig  = data.get("error_signature", "")
         fix  = str(data.get("fix_applied", "") or "")
         now  = datetime.now(UTC).isoformat()
 
+        # Summarise the key steps from a successful fix for future RCA context
+        raw_steps  = data.get("key_steps") or []
+        key_steps_json = _json.dumps(
+            [str(s)[:200] for s in raw_steps if s][:8]  # at most 8 steps, 200 chars each
+        ) if raw_steps else None
+
         cur.execute(
-            'SELECT pattern_id, applied_count, fix_applied, "success_count", "replay_success_count" FROM fix_patterns WHERE error_signature=?',
+            'SELECT pattern_id, applied_count, fix_applied, "success_count", "replay_success_count", "key_steps" FROM fix_patterns WHERE error_signature=?',
             (sig,),
         )
         rows = _rows_to_dicts(cur)
@@ -655,26 +667,29 @@ def upsert_fix_pattern(data: Dict, replay_success: bool = False):
         if existing:
             new_success = (existing.get("success_count") or 0) + (1 if outcome == "SUCCESS" else 0)
             new_replay  = (existing.get("replay_success_count") or 0) + (1 if replay_success else 0)
+            # Only overwrite key_steps when this fix succeeded (preserve last successful steps)
+            new_steps   = key_steps_json if (outcome == "SUCCESS" and key_steps_json) else existing.get("key_steps")
             cur.execute(
                 """UPDATE fix_patterns
                    SET applied_count=?, outcome=?, last_seen=?,
-                       "success_count"=?, "replay_success_count"=?
+                       "success_count"=?, "replay_success_count"=?, "key_steps"=?
                    WHERE pattern_id=?""",
-                (existing["applied_count"] + 1, outcome, now, new_success, new_replay, existing["pattern_id"]),
+                (existing["applied_count"] + 1, outcome, now, new_success, new_replay, new_steps, existing["pattern_id"]),
             )
         else:
             cur.execute(
                 """INSERT INTO fix_patterns
                    (pattern_id, error_signature, iflow_id, error_type,
                     root_cause, fix_applied, outcome, applied_count, last_seen,
-                    "success_count", "replay_success_count")
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    "success_count", "replay_success_count", "key_steps")
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     str(uuid.uuid4()), sig,
                     data.get("iflow_id", ""), data.get("error_type", ""),
                     data.get("root_cause", ""), fix, outcome, 1, now,
                     1 if outcome == "SUCCESS" else 0,
                     1 if replay_success else 0,
+                    key_steps_json if outcome == "SUCCESS" else None,
                 ),
             )
         conn.commit()
