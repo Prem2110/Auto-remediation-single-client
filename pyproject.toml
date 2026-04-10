@@ -29,3 +29,10 @@ dependencies = [
     "uvicorn[standard]>=0.40.0",
     "yaspin>=3.4.0",
 ]
+
+[dependency-groups]
+dev = [
+    "mkdocs>=1.6.1",
+    "mkdocs-material>=9.7.6",
+    "mkdocs-minify-plugin>=0.8.0",
+]
