@@ -507,6 +507,55 @@ def get_all_incidents(status: Optional[str] = None, limit: int = 50) -> List[Dic
         return []
 
 
+def get_stage_counts() -> dict:
+    """
+    Return pipeline stage counts using a single GROUP BY query —
+    never fetches row data, safe on large tables.
+    """
+    stage_map = {
+        "DETECTED":          "observed",
+        "RCA_IN_PROGRESS":   "classified",
+        "RCA_COMPLETE":      "rca",
+        "FIX_IN_PROGRESS":   "fix",
+        "FIX_DEPLOYED":      "fix",
+        "AWAITING_APPROVAL": "fix",
+        "FIX_VERIFIED":      "verified",
+        "HUMAN_INITIATED_FIX": "verified",
+        "RETRIED":           "verified",
+    }
+    counts = {"observed": 0, "classified": 0, "rca": 0, "fix": 0, "verified": 0}
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        cur.execute("SELECT status, COUNT(*) FROM autonomous_incidents GROUP BY status")
+        for row in cur.fetchall():
+            s, n = (row[0] or "").upper(), int(row[1] or 0)
+            stage = stage_map.get(s)
+            if stage:
+                counts[stage] += n
+        conn.close()
+    except Exception as e:
+        logger.error(f"get_stage_counts: {e}")
+    return counts
+
+
+def count_all_incidents(status: Optional[str] = None) -> int:
+    """Return the exact row count from autonomous_incidents (no LIMIT)."""
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        if status:
+            cur.execute("SELECT COUNT(*) FROM autonomous_incidents WHERE status=?", (status,))
+        else:
+            cur.execute("SELECT COUNT(*) FROM autonomous_incidents")
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else 0
+    except Exception as e:
+        logger.error(f"count_all_incidents: {e}")
+        return 0
+
+
 def _normalize_incident_dict(d: Dict) -> Dict:
     if isinstance(d.get("tags"), str):
         try:
