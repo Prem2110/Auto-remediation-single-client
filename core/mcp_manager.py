@@ -153,9 +153,11 @@ class MultiMCP:
         for name, url in MCP_SERVERS.items():
             try:
                 opts = TRANSPORT_OPTIONS.get(name, {})
-                def factory(**kw):
-                    kw["verify"]  = opts.get("verify", True)
-                    kw["timeout"] = opts.get("timeout", 30)
+                # Use a default-arg capture to avoid the Python closure-in-loop bug:
+                # without _opts=opts, all factories would share the final loop value of opts.
+                def factory(**kw, _opts=opts):
+                    kw["verify"]  = _opts.get("verify", True)
+                    kw["timeout"] = _opts.get("timeout", 30)
                     return httpx.AsyncClient(**kw)
                 transport          = StreamableHttpTransport(url, httpx_client_factory=factory)
                 self.clients[name] = Client(transport=transport)

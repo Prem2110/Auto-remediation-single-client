@@ -1416,7 +1416,7 @@ Rules:
         while self._autonomous_running:
             try:
                 # Approval-timeout sweep — run every 5 minutes, not every tick
-                now = asyncio.get_event_loop().time()
+                now = asyncio.get_running_loop().time()
                 if self._observer and (now - _last_timeout_check) >= _TIMEOUT_CHECK_EVERY:
                     try:
                         await self._observer._check_pending_approval_timeouts()
@@ -1458,7 +1458,7 @@ Rules:
         if _AEM_ENABLED:
             rt = solace_client._receiver_thread
             if rt is None or not rt.is_alive():
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 solace_client.start_receiver(loop)
 
         async def _guarded():

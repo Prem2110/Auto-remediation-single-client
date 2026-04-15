@@ -142,8 +142,9 @@ async def lifespan(app: FastAPI):
     # Create orchestrator with all specialist references
     orchestrator = OrchestratorAgent(mcp, _rca, _fix, _verifier)
 
-    # Wire observer → orchestrator (late injection to avoid circular import)
+    # Wire observer ↔ orchestrator (late injection to avoid circular import)
     observer.set_orchestrator(orchestrator)
+    orchestrator.set_observer(observer)   # must be set before start() so OData fallback works at boot
 
     # Wire error_fetcher → fix agent and verifier agent (shared token cache)
     _fix.set_error_fetcher(observer.error_fetcher)
@@ -192,7 +193,7 @@ async def lifespan(app: FastAPI):
             await solace_client.connect()
             logger.info("[Startup] Solace Web Messaging client connected.")
             if AUTONOMOUS_ENABLED:
-                solace_client.start_receiver(asyncio.get_event_loop())
+                solace_client.start_receiver(asyncio.get_running_loop())
                 logger.info("[Startup] Solace receiver thread started — consuming from queue.")
         except Exception as exc:
             logger.error("[Startup] Solace connect/receiver failed: %s", exc)
@@ -1047,10 +1048,13 @@ async def autonomous_debug2():
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn  # noqa: PLC0415
+    _port = int(os.getenv("PORT", "8080"))   # BTP CF injects $PORT; 8080 for local dev
+    _dev  = os.getenv("APP_ENV", "production").lower() == "development"
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8080,
-        reload=True,
-        reload_excludes=["*.log", "*.db", "logs/*", "__pycache__"],
+        port=_port,
+        reload=_dev,
+        reload_excludes=["*.log", "*.db", "logs/*", "__pycache__"] if _dev else [],
+        log_level="info",
     )

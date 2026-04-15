@@ -109,7 +109,7 @@ class SolaceClient:
 
     async def connect(self) -> None:
         """Connect to Solace broker and start the direct publisher (async wrapper)."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._connect_sync)
 
     def _connect_sync(self) -> None:
@@ -133,7 +133,7 @@ class SolaceClient:
         if self._service is None or self._publisher is None:
             logger.error("[Solace] publish() called before connect()")
             return
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._publish_sync, topic, payload)
 
     def _publish_sync(self, topic: str, payload: Dict[str, Any]) -> None:

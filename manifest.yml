@@ -1,0 +1,55 @@
+---
+# SAP BTP Cloud Foundry — deployment manifest
+# Usage: cf push
+applications:
+  - name: sap-cpi-self-healing-agent
+    memory: 2G
+    disk_quota: 2G
+    instances: 1
+    buildpacks:
+      - python_buildpack
+    command: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --log-level info
+    health-check-type: http
+    health-check-http-endpoint: /
+    health-check-invocation-timeout: 60
+    timeout: 180
+    env:
+      PYTHONUNBUFFERED: "1"
+      ENABLE_CONSOLE_LOGS: "true"
+      # ── LLM ──────────────────────────────────────────────
+      # LLM_DEPLOYMENT_ID: <set in BTP environment>
+      # LLM_DEPLOYMENT_ID_RCA: <set in BTP environment>
+      # LLM_DEPLOYMENT_ID_FIX: <set in BTP environment>
+      # ── HANA ──────────────────────────────────────────────
+      # HANA_HOST: <set in BTP environment>
+      # HANA_USER: <set in BTP environment>
+      # HANA_PASSWORD: <set in BTP environment>
+      # HANA_PORT: "443"
+      # HANA_SCHEMA: <set in BTP environment>
+      # ── SAP AI Core ───────────────────────────────────────
+      # AICORE_AUTH_URL: <set in BTP environment>
+      # AICORE_CLIENT_ID: <set in BTP environment>
+      # AICORE_CLIENT_SECRET: <set in BTP environment>
+      # AICORE_BASE_URL: <set in BTP environment>
+      # AICORE_RESOURCE_GROUP: <set in BTP environment>
+      # ── SAP CPI ───────────────────────────────────────────
+      # SAP_HUB_TENANT_URL: <set in BTP environment>
+      # SAP_CPI_CLIENT_ID: <set in BTP environment>
+      # SAP_CPI_CLIENT_SECRET: <set in BTP environment>
+      # SAP_CPI_TOKEN_URL: <set in BTP environment>
+      # ── AEM / Solace ──────────────────────────────────────
+      # AEM_ENABLED: "true"
+      # AEM_HOST: <set in BTP environment>
+      # AEM_VPN: <set in BTP environment>
+      # AEM_USERNAME: <set in BTP environment>
+      # AEM_PASSWORD: <set in BTP environment>
+      # AEM_OBSERVER_QUEUE: sap.cpi.autofix.observer.out
+      # AEM_OBSERVER_TOPIC: sap/cpi/autofix/observer/out
+      # ── S3 ────────────────────────────────────────────────
+      # AWS_ACCESS_KEY_ID: <set in BTP environment>
+      # AWS_SECRET_ACCESS_KEY: <set in BTP environment>
+      # AWS_REGION: <set in BTP environment>
+      # S3_BUCKET_NAME: <set in BTP environment>
+      # ── Autonomous loop ───────────────────────────────────
+      AUTONOMOUS_ENABLED: "true"
+      AUTO_FIX_ALL_CPI_ERRORS: "false"

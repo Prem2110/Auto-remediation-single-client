@@ -27,3 +27,4 @@ build/
 # Locks
 uv.lock
 .python-version
+
