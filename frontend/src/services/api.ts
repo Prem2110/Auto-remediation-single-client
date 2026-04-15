@@ -138,37 +138,9 @@ export async function uploadFile(formData: FormData): Promise<unknown> {
   return postForm(`${_BASE}/query`, formData);
 }
 
-export async function fetchDashboardKpi(): Promise<unknown> {
-  return request(`${_BASE}/dashboard/kpi-cards`);
-}
-
-export async function fetchDashboardStatusBreakdown(): Promise<unknown[]> {
-  const data = await request<unknown>(`${_BASE}/dashboard/status-breakdown`);
-  if (Array.isArray(data)) return data;
-  if ((data as Record<string, unknown[]>).breakdown) return (data as Record<string, unknown[]>).breakdown;
-  return (data as Record<string, unknown[]>).data
-    || (data as Record<string, unknown[]>).results
-    || [data];
-}
-
-export async function fetchDashboardErrorDistribution(): Promise<{ distribution: unknown[] }> {
-  return request(`${_BASE}/dashboard/error-distribution`);
-}
-
-export async function fetchDashboardTopIflows(): Promise<{ top_iflows: unknown[] }> {
-  return request(`${_BASE}/dashboard/top-failing-iflows`);
-}
-
-export async function fetchDashboardTimeline(): Promise<{ series: unknown[] }> {
-  return request(`${_BASE}/dashboard/failures-over-time`);
-}
-
-export async function fetchDashboardRecentFailures(): Promise<{ recent_failures: unknown[] }> {
-  return request(`${_BASE}/dashboard/recent-failures-table`);
-}
-
-export async function fetchDashboardActiveIncidents(): Promise<{ active_incidents: unknown[] }> {
-  return request(`${_BASE}/dashboard/active-incidents-table`);
+// Single endpoint — replaces 7 separate dashboard requests with one roundtrip
+export async function fetchDashboardAll(): Promise<Record<string, unknown>> {
+  return request(`${_BASE}/dashboard/all`);
 }
 
 export interface AgentStatus {
@@ -330,4 +302,64 @@ export async function fetchIncidents(
   const params = new URLSearchParams({ limit: String(limit) });
   if (status) params.set("status", status);
   return request(`${_BASE}/autonomous/incidents?${params}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pagination APIs for dashboard tables
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface PaginatedMessagesResponse {
+  count: number;
+  total_count: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+  has_next: boolean;
+  has_previous: boolean;
+  messages: unknown[];
+}
+
+export async function fetchFailedMessagesPaginated(
+  page = 1,
+  pageSize = 20,
+  status?: string,
+  type?: string,
+  id?: string,
+  artifacts?: string
+): Promise<PaginatedMessagesResponse> {
+  const params = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
+  });
+  if (status) params.set("status", status);
+  if (type) params.set("type", type);
+  if (id) params.set("id", id);
+  if (artifacts) params.set("artifacts", artifacts);
+
+  return request(`${_BASE}/smart-monitoring/messages/paginated?${params}`);
+}
+
+export interface PaginatedIncidentsResponse {
+  count: number;
+  total_count: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+  has_next: boolean;
+  has_previous: boolean;
+  incidents: unknown[];
+}
+
+export async function fetchActiveIncidentsPaginated(
+  page = 1,
+  pageSize = 20,
+  status?: string
+): Promise<PaginatedIncidentsResponse> {
+  const params = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
+  });
+  if (status) params.set("status", status);
+
+  return request(`${_BASE}/dashboard/incidents/paginated?${params}`);
 }

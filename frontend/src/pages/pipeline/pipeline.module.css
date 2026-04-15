@@ -409,7 +409,7 @@
 .table tr:last-child td { border-bottom: none; }
 .table tr:hover td { background: #f8fafc; }
 
-.tdIflow   { font-weight: 600; color: #1e3a5f; max-width: 12rem; word-break: break-word; }
+.tdIflow   { font-weight: 600; color: #1e3a5f; max-width: 18rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tdIflowUnknown { font-weight: 400; color: #94a3b8; font-style: italic; font-size: 0.75rem; }
 .tdRca     { max-width: 18rem; font-size: 0.75rem; color: #4b5563; line-height: 1.4; }
 .tdDate    { white-space: nowrap; font-size: 0.72rem; color: #64748b; }

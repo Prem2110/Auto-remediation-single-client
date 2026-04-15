@@ -629,14 +629,19 @@ async def list_loaded_tools(server: Optional[str] = None):
 async def get_incidents(status: Optional[str] = None, limit: int = 50):
     try:
         incidents = get_all_incidents(status=status, limit=limit)
+        def _is_sap_guid(value: str) -> bool:
+            # SAP artifact GUIDs are 20+ char alphanumeric strings with no spaces,
+            # underscores, or hyphens — e.g. "AGeNKJ3Th6DlBzQ2v9X1". Human-readable
+            # iFlow names always contain at least one underscore, hyphen, or space.
+            import re
+            return bool(value) and len(value) >= 18 and bool(re.fullmatch(r"[A-Za-z0-9]{18,}", value))
+
         for inc in incidents:
             if not inc.get("iflow_name"):
-                # artifact_id is a SAP GUID — skip it; only use human-readable fields
+                raw_id = inc.get("iflow_id") or ""
                 inc["iflow_name"] = (
-                    inc.get("iflow_id") or
-                    inc.get("integration_flow_name") or
-                    ""
-                )
+                    "" if _is_sap_guid(raw_id) else raw_id
+                ) or inc.get("integration_flow_name") or ""
         return {"incidents": incidents, "total": len(incidents)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

@@ -1,19 +1,20 @@
 import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
 import {
   PieChart, Pie, Cell, Tooltip, Legend, ResponsiveContainer,
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
   LineChart, Line,
 } from "recharts";
 import {
-  fetchDashboardKpi,
-  fetchDashboardStatusBreakdown,
-  fetchDashboardErrorDistribution,
-  fetchDashboardTopIflows,
-  fetchDashboardTimeline,
-  fetchDashboardRecentFailures,
-  fetchDashboardActiveIncidents,
+  fetchDashboardAll,
   fetchQueueStats,
+  fetchFailedMessagesPaginated,
+  fetchActiveIncidentsPaginated,
+  type PaginatedMessagesResponse,
+  type PaginatedIncidentsResponse,
 } from "../../services/api.ts";
+import { usePagination } from "../../hooks/usePagination";
+import Pagination from "../../components/pagination/Pagination";
 import styles from "./dashboard.module.css";
 
 // ── Colour palettes ────────────────────────────────────────────────────────────
@@ -122,37 +123,69 @@ function SkeletonRows({ count = 5 }: { count?: number }) {
 // ── Main component ────────────────────────────────────────────────────────────
 export default function Dashboard() {
   const qOpts = { refetchInterval: 60_000, retry: 3, retryDelay: 3_000 } as const;
-  const { data: kpi,       isLoading: kpiLoading }      = useQuery({ queryKey: ["dash-kpi"],       queryFn: fetchDashboardKpi,               ...qOpts });
-  const { data: status,    isLoading: statusLoading }    = useQuery({ queryKey: ["dash-status"],     queryFn: fetchDashboardStatusBreakdown,   ...qOpts });
-  const { data: errorDist, isLoading: errorLoading }     = useQuery({ queryKey: ["dash-error"],      queryFn: fetchDashboardErrorDistribution, ...qOpts });
-  const { data: iflows,    isLoading: iflowsLoading }    = useQuery({ queryKey: ["dash-iflows"],     queryFn: fetchDashboardTopIflows,         ...qOpts });
-  const { data: timeline,  isLoading: timelineLoading }  = useQuery({ queryKey: ["dash-timeline"],   queryFn: fetchDashboardTimeline,          ...qOpts });
-  const { data: failures,  isLoading: failuresLoading }  = useQuery({ queryKey: ["dash-failures"],   queryFn: fetchDashboardRecentFailures,    ...qOpts });
-  const { data: incidents, isLoading: incidentsLoading } = useQuery({ queryKey: ["dash-incidents"],  queryFn: fetchDashboardActiveIncidents,   ...qOpts });
-  const { data: aemRaw,    isLoading: aemLoading }       = useQuery({ queryKey: ["queue-stats"],     queryFn: fetchQueueStats,                 ...qOpts });
+  
+  // ─ Fetch consolidated dashboard data (charts, KPIs, AEM stats) ────────────────
+  const { data: dashData, isLoading: dashLoading } = useQuery({ 
+    queryKey: ["dash-all"],
+    queryFn: fetchDashboardAll,
+    ...qOpts,
+  });
+  
+  // Get total counts from API to sync with pagination
+  const failuresTotalCount = ((dashData as any)?.total_messages_count ?? 0) as number;
+  const incidentsTotalCount = ((dashData as any)?.total_incidents_count ?? 0) as number;
+  
+  // ─ Pagination for Recent Failed Messages ──────────────────────────────────────
+  const failuresPagination = usePagination(20, failuresTotalCount);
+  const { data: failuresData, isLoading: failuresLoading } = useQuery({
+    queryKey: ["dash-failures-paginated", failuresPagination.currentPage, failuresPagination.pageSize],
+    queryFn: () => fetchFailedMessagesPaginated(
+      failuresPagination.currentPage,
+      failuresPagination.pageSize,
+    ),
+    ...qOpts,
+  });
 
-  const k = (kpi ?? {}) as Record<string, unknown>;
-  const statusData    = (status ?? []) as { status: string; count: number }[];
-  const errorData     = ((errorDist as Record<string, unknown[]> | undefined)?.distribution ?? []) as { error_type: string; count: number }[];
-  const iflowData     = ((iflows   as Record<string, unknown[]> | undefined)?.top_iflows   ?? []) as { iflow_name: string; failure_count: number }[];
-  const timelineData  = ((timeline as Record<string, unknown[]> | undefined)?.series        ?? []) as { time: string; count: number }[];
-  const recentFails   = ((failures as Record<string, unknown[]> | undefined)?.recent_failures    ?? []) as Record<string, unknown>[];
-  const activeInc     = ((incidents as Record<string, unknown[]> | undefined)?.active_incidents  ?? []) as Record<string, unknown>[];
+  // ─ Pagination for Active Incidents ────────────────────────────────────────────
+  const incidentsPagination = usePagination(20, incidentsTotalCount);
+  const { data: incidentsData, isLoading: incidentsLoading } = useQuery({
+    queryKey: ["dash-incidents-paginated", incidentsPagination.currentPage, incidentsPagination.pageSize],
+    queryFn: () => fetchActiveIncidentsPaginated(
+      incidentsPagination.currentPage,
+      incidentsPagination.pageSize,
+    ),
+    ...qOpts,
+  });
 
-  const aem = (aemRaw ?? {}) as Record<string, unknown>;
-  const aemEnabled   = !aem.warning;
+  // Parse consolidated dashboard data
+  const dash = (dashData ?? {}) as Record<string, unknown>;
+  const kpi = (dash.kpi ?? {}) as Record<string, unknown>;
+  const statusData = (dash.status_breakdown ?? []) as { status: string; count: number }[];
+  const errorData = (dash.error_distribution ?? []) as { error_type: string; count: number }[];
+  const iflowData = (dash.top_iflows ?? []) as { iflow_name: string; failure_count: number }[];
+  const timelineData = (dash.timeline ?? []) as { time: string; count: number }[];
+  
+  const aem = (dash.aem ?? {}) as Record<string, unknown>;
+  const aemEnabled = !aem.warning;
   const aemSempError = aem.semp_error as string | null;
-  const aemQueues    = (aem.queues ?? {}) as Record<string, { queue_depth: number; messages_retrieved: number }>;
+  const aemQueues = (aem.queues ?? {}) as Record<string, { queue_depth: number; messages_retrieved: number }>;
   const aemQueueDepth = Object.values(aemQueues).reduce((s, q) => s + (q.queue_depth ?? 0), 0);
-  const aemStageRaw  = (aem.stage_counts ?? {}) as Record<string, number>;
+  const aemStageRaw = (aem.stage_counts ?? {}) as Record<string, number>;
   const aemStageData = Object.entries(aemStageRaw).map(([stage, count]) => ({ stage, count }));
+
+  // Extract paginated table data
+  const recentFails = ((failuresData as PaginatedMessagesResponse | undefined)?.messages ?? []) as Record<string, unknown>[];
+  const apiFailuresTotalCount = (failuresData as PaginatedMessagesResponse | undefined)?.total_count ?? 0;
+  
+  const activeInc = ((incidentsData as PaginatedIncidentsResponse | undefined)?.incidents ?? []) as Record<string, unknown>[];
+  const apiIncidentsTotalCount = (incidentsData as PaginatedIncidentsResponse | undefined)?.total_count ?? 0;
 
   return (
     <div className={styles.page}>
       <h2 className={styles.pageTitle}>Smart Monitoring</h2>
 
       {/* ── AEM Status Banner ── */}
-      {!aemLoading && (
+      {!dashLoading && (
         <div className={styles.aemBanner} data-enabled={aemEnabled}>
           <span className={styles.aemDot} />
           <span className={styles.aemLabel} data-tip={aemEnabled ? "Advanced Event Mesh is connected — incidents sourced via Solace pub/sub messaging" : "AEM is disabled — using direct SAP CPI polling"}>
@@ -177,7 +210,7 @@ export default function Dashboard() {
 
       {/* ── KPI Cards ── */}
       <div className={styles.kpiRow}>
-        {kpiLoading ? (
+        {dashLoading ? (
           Array.from({ length: 9 }).map((_, i) => (
             <div key={i} className={styles.kpiCard}>
               <div className={`${styles.skeleton}`} style={{ height: "0.75rem", width: "70%" }} />
@@ -186,15 +219,15 @@ export default function Dashboard() {
           ))
         ) : (
           <>
-            <KpiCard header="Failed Messages" subheader="Live" value={k.total_failed_messages} tooltip="SAP CPI messages currently in FAILED state, polled live from the message processing log" />
-            <KpiCard header="Total Incidents" value={k.total_incidents} tooltip="All incidents tracked by the auto-remediation pipeline, including resolved and active" />
-            <KpiCard header="In Progress" value={k.in_progress} tooltip="Incidents currently being analyzed or fixed by pipeline agents" />
-            <KpiCard header="Fix Failed" value={k.fix_failed} indicator="Down" valueColor="Critical" tooltip="Incidents where the automated fix failed — manual review required" />
-            <KpiCard header="Auto Fixed" value={k.auto_fixed} indicator="Up" valueColor="Good" tooltip="Incidents resolved automatically without any human intervention" />
-            <KpiCard header="Pending Approval" value={k.pending_approval} tooltip="Fixes generated but awaiting manual approval before deployment to production" />
-            <KpiCard header="Auto Fix Rate" value={k.auto_fix_rate} unit="%" tooltip="Percentage of incidents resolved automatically vs all closed incidents" />
-            <KpiCard header="Avg Resolution Time" subheader="minutes" value={k.avg_resolution_time_minutes} unit="min" tooltip="Mean time from incident detection to terminal state (auto-fixed or failed)" />
-            <KpiCard header="RCA Coverage" value={k.rca_coverage_percent} unit="%" indicator="Up" valueColor="Good" tooltip="Percentage of incidents that received AI-powered root cause analysis" />
+            <KpiCard header="Failed Messages" subheader="Live" value={kpi.total_failed_messages} tooltip="SAP CPI messages currently in FAILED state, polled live from the message processing log" />
+            <KpiCard header="Total Incidents" value={kpi.total_incidents} tooltip="All incidents tracked by the auto-remediation pipeline, including resolved and active" />
+            <KpiCard header="In Progress" value={kpi.in_progress} tooltip="Incidents currently being analyzed or fixed by pipeline agents" />
+            <KpiCard header="Fix Failed" value={kpi.fix_failed} indicator="Down" valueColor="Critical" tooltip="Incidents where the automated fix failed — manual review required" />
+            <KpiCard header="Auto Fixed" value={kpi.auto_fixed} indicator="Up" valueColor="Good" tooltip="Incidents resolved automatically without any human intervention" />
+            <KpiCard header="Pending Approval" value={kpi.pending_approval} tooltip="Fixes generated but awaiting manual approval before deployment to production" />
+            <KpiCard header="Auto Fix Rate" value={kpi.auto_fix_rate} unit="%" tooltip="Percentage of incidents resolved automatically vs all closed incidents" />
+            <KpiCard header="Avg Resolution Time" subheader="minutes" value={kpi.avg_resolution_time_minutes} unit="min" tooltip="Mean time from incident detection to terminal state (auto-fixed or failed)" />
+            <KpiCard header="RCA Coverage" value={kpi.rca_coverage_percent} unit="%" indicator="Up" valueColor="Good" tooltip="Percentage of incidents that received AI-powered root cause analysis" />
           </>
         )}
       </div>
@@ -202,7 +235,7 @@ export default function Dashboard() {
       {/* ── Status Breakdown ── */}
       <div className={styles.chartBlock}>
         <SectionTitle title="Status Breakdown" />
-        {statusLoading ? <SkeletonChart /> : (
+        {dashLoading ? <SkeletonChart /> : (
           <ResponsiveContainer width="100%" height={320}>
             <PieChart>
               <Pie data={statusData} dataKey="count" nameKey="status" cx="35%" label>
@@ -228,7 +261,7 @@ export default function Dashboard() {
       <div className={styles.chartsRow}>
         <div className={styles.chartHalf}>
           <SectionTitle title="Error Distribution" />
-          {errorLoading ? <SkeletonChart /> : (
+          {dashLoading ? <SkeletonChart /> : (
             <ResponsiveContainer width="100%" height={300}>
               <PieChart>
                 <Pie data={errorData} dataKey="count" nameKey="error_type" innerRadius="40%" outerRadius="70%" label>
@@ -245,7 +278,7 @@ export default function Dashboard() {
 
         <div className={styles.chartHalf}>
           <SectionTitle title="Top Failing iFlows" />
-          {iflowsLoading ? <SkeletonChart /> : (
+          {dashLoading ? <SkeletonChart /> : (
             <ResponsiveContainer width="100%" height={300}>
               <BarChart data={iflowData} layout="vertical" margin={{ left: 20 }}>
                 <CartesianGrid strokeDasharray="3 3" />
@@ -262,7 +295,7 @@ export default function Dashboard() {
       {/* ── Failures Over Time ── */}
       <div className={styles.chartBlock}>
         <SectionTitle title="Failures Over Time" />
-        {timelineLoading ? <SkeletonChart /> : (
+        {dashLoading ? <SkeletonChart /> : (
           <ResponsiveContainer width="100%" height={300}>
             <LineChart data={timelineData} margin={{ left: 10, right: 10 }}>
               <CartesianGrid strokeDasharray="3 3" />
@@ -279,7 +312,7 @@ export default function Dashboard() {
       {aemEnabled && (
         <div className={styles.chartBlock}>
           <SectionTitle title="AEM Pipeline Stage Counts" />
-          {aemLoading ? <SkeletonChart /> : aemStageData.length === 0 ? (
+          {dashLoading ? <SkeletonChart /> : aemStageData.length === 0 ? (
             <div className={styles.emptyCell}>No stage data — pipeline not yet running</div>
           ) : (
             <ResponsiveContainer width="100%" height={220}>
@@ -295,7 +328,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── Recent Failed Messages ── */}
+      {/* ── Recent Failed Messages with Pagination ── */}
       <div className={styles.tableBlock}>
         <SectionTitle title="Recent Failed Messages" />
         <div className={styles.tableWrapper}>
@@ -328,9 +361,22 @@ export default function Dashboard() {
             </tbody>
           </table>
         </div>
+        {!failuresLoading && recentFails.length > 0 && (
+          <Pagination
+            currentPage={failuresPagination.currentPage}
+            totalPages={failuresPagination.totalPages}
+            pageSize={failuresPagination.pageSize}
+            totalCount={apiFailuresTotalCount}
+            hasNextPage={failuresPagination.hasNextPage}
+            hasPreviousPage={failuresPagination.hasPreviousPage}
+            onPreviousClick={failuresPagination.previousPage}
+            onNextClick={failuresPagination.nextPage}
+            onPageSizeChange={failuresPagination.setPageSize}
+          />
+        )}
       </div>
 
-      {/* ── Active Incidents ── */}
+      {/* ── Active Incidents with Pagination ── */}
       <div className={styles.tableBlock}>
         <SectionTitle title="Active Incidents" />
         <div className={styles.tableWrapper}>
@@ -374,6 +420,19 @@ export default function Dashboard() {
             </tbody>
           </table>
         </div>
+        {!incidentsLoading && activeInc.length > 0 && (
+          <Pagination
+            currentPage={incidentsPagination.currentPage}
+            totalPages={incidentsPagination.totalPages}
+            pageSize={incidentsPagination.pageSize}
+            totalCount={apiIncidentsTotalCount}
+            hasNextPage={incidentsPagination.hasNextPage}
+            hasPreviousPage={incidentsPagination.hasPreviousPage}
+            onPreviousClick={incidentsPagination.previousPage}
+            onNextClick={incidentsPagination.nextPage}
+            onPageSizeChange={incidentsPagination.setPageSize}
+          />
+        )}
       </div>
     </div>
   );

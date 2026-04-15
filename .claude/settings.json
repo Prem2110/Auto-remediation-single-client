@@ -29,7 +29,8 @@
       "Bash(python -c \"from solace.messaging.messaging_service import MessagingService; print\\('solace import OK'\\)\")",
       "Bash(python3 -c \"import solace_pubsubplus\")",
       "Bash(python3 -c \"import solace\")",
-      "Bash(pip index *)"
+      "Bash(pip index *)",
+      "Bash(xargs grep *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\PremkumarUthayakumar\\Desktop\\projects\\New folder\\auto-remediation"

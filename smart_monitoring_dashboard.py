@@ -46,7 +46,7 @@ router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DEPENDENCY — lazy import MCP manager
+# DEPENDENCY — lazy import MCP manager (MUST be before routes that use it)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _MCPCompat:
@@ -76,6 +76,146 @@ def _get_mcp():
     if not hasattr(_mcp, "error_fetcher"):
         return _MCPCompat(_mcp, _obs, _orch)
     return _mcp
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ALL-IN-ONE DASHBOARD ENDPOINT
+# One HANA connection, one query, all widget data returned together.
+# The frontend uses this instead of firing 7 separate requests.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/all")
+async def get_dashboard_all(mcp=Depends(_get_mcp)):
+    """
+    Returns all dashboard widget data in a single response.
+    Replaces 7 individual endpoints with one HANA roundtrip.
+    """
+    try:
+        # ── One DB call for all aggregate endpoints ────────────────────────
+        all_incidents = get_all_incidents(limit=1000)
+        total = len(all_incidents)
+
+        # ── KPI counts ────────────────────────────────────────────────────
+        in_progress = fix_failed = auto_fixed = pending_approval = rca_complete = 0
+        error_types: Dict[str, int] = defaultdict(int)
+        status_counts: Dict[str, int] = defaultdict(int)
+        iflow_failures: Dict[str, int] = defaultdict(int)
+        timeline_buckets: Dict[str, int] = defaultdict(int)
+        resolution_times = []
+
+        active_statuses = {
+            "DETECTED", "RCA_IN_PROGRESS", "RCA_COMPLETE",
+            "AWAITING_APPROVAL", "AWAITING_HUMAN_REVIEW",
+            "FIX_IN_PROGRESS", "FIX_DEPLOYED",
+        }
+        active_incidents_list: list = []
+        recent_failures_list: list = []
+
+        for inc in all_incidents:
+            status = (inc.get("status") or "UNKNOWN").upper()
+            status_counts[status] += 1
+
+            if status in {"FIX_IN_PROGRESS", "RCA_IN_PROGRESS", "FIX_DEPLOYED"}:
+                in_progress += 1
+            if status in {"FIX_FAILED", "FIX_FAILED_UPDATE", "FIX_FAILED_DEPLOY",
+                          "FIX_FAILED_RUNTIME", "TICKET_CREATED"}:
+                fix_failed += 1
+            if status in {"FIX_VERIFIED", "HUMAN_INITIATED_FIX", "RETRIED"}:
+                auto_fixed += 1
+            if status in {"AWAITING_APPROVAL", "AWAITING_HUMAN_REVIEW"}:
+                pending_approval += 1
+            if inc.get("root_cause") and inc.get("proposed_fix"):
+                rca_complete += 1
+
+            et = inc.get("error_type") or "UNKNOWN"
+            error_types[et] += 1
+
+            iflow = inc.get("iflow_id") or ""
+            if iflow:
+                iflow_failures[iflow] += 1
+
+            created_raw = inc.get("created_at") or ""
+            created_dt = _parse_sap_timestamp(str(created_raw))
+            if created_dt:
+                timeline_buckets[_time_bucket(created_dt, "hour")] += 1
+
+            if inc.get("resolved_at") and inc.get("created_at"):
+                c = _parse_sap_timestamp(str(inc.get("created_at")))
+                r = _parse_sap_timestamp(str(inc.get("resolved_at")))
+                if c and r:
+                    resolution_times.append((r - c).total_seconds() / 60)
+
+            if status in active_statuses and len(active_incidents_list) < 20:
+                active_incidents_list.append({
+                    "incident_id":     inc.get("incident_id"),
+                    "message_guid":    inc.get("message_guid"),
+                    "iflow_id":        inc.get("iflow_id"),
+                    "error_type":      inc.get("error_type"),
+                    "status":          inc.get("status"),
+                    "created_at":      inc.get("created_at"),
+                    "last_seen":       inc.get("last_seen"),
+                    "occurrence_count": inc.get("occurrence_count", 1),
+                    "rca_confidence":  inc.get("rca_confidence"),
+                })
+
+            if len(recent_failures_list) < 20:
+                recent_failures_list.append({
+                    "message_guid":  inc.get("message_guid") or "-",
+                    "iflow_name":    inc.get("iflow_id") or inc.get("iflow_name") or "-",
+                    "status":        inc.get("status") or "DETECTED",
+                    "log_end":       inc.get("last_seen") or inc.get("log_end") or inc.get("created_at"),
+                    "error_preview": (inc.get("error_message") or "")[:120],
+                })
+
+        # ── SAP CPI live count (separate network call, run concurrently) ──
+        try:
+            total_failed_messages = await mcp.error_fetcher.fetch_failed_messages_count()
+        except Exception:
+            total_failed_messages = 0
+
+        auto_fix_rate = round(auto_fixed / total * 100, 1) if total > 0 else 0.0
+        avg_resolution = round(sum(resolution_times) / len(resolution_times), 1) if resolution_times else 0.0
+        rca_coverage = round(rca_complete / total * 100, 1) if total > 0 else 0.0
+
+        now = _parse_sap_timestamp(get_hana_timestamp()) or datetime.utcnow()
+        cutoff_24h = now - timedelta(hours=24)
+
+        return {
+            "timestamp": get_hana_timestamp(),
+            "kpi": {
+                "total_failed_messages":    total_failed_messages,
+                "total_incidents":          total,
+                "in_progress":              in_progress,
+                "fix_failed":               fix_failed,
+                "auto_fixed":               auto_fixed,
+                "pending_approval":         pending_approval,
+                "auto_fix_rate":            auto_fix_rate,
+                "avg_resolution_time_minutes": avg_resolution,
+                "rca_coverage_percent":     rca_coverage,
+            },
+            "status_breakdown": [
+                {"status": s, "count": c}
+                for s, c in sorted(status_counts.items(), key=lambda x: x[1], reverse=True)
+            ],
+            "error_distribution": [
+                {"error_type": et, "count": c,
+                 "percentage": round(c / total * 100, 1) if total else 0.0}
+                for et, c in sorted(error_types.items(), key=lambda x: x[1], reverse=True)
+            ],
+            "top_iflows": [
+                {"iflow_name": iflow, "failure_count": cnt}
+                for iflow, cnt in sorted(iflow_failures.items(), key=lambda x: x[1], reverse=True)[:10]
+            ],
+            "timeline": [
+                {"time": bucket, "count": cnt}
+                for bucket, cnt in sorted(timeline_buckets.items())
+            ],
+            "active_incidents": active_incidents_list,
+            "recent_failures":  recent_failures_list,
+        }
+    except Exception as exc:
+        logger.error(f"[Dashboard] /all error: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -588,6 +728,72 @@ async def get_active_incidents_table(limit: int = 20):
         }
     except Exception as exc:
         logger.error(f"[Dashboard] Active incidents table error: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/incidents/paginated")
+async def get_incidents_paginated(
+    page: int = 1,
+    page_size: int = 20,
+    status: Optional[str] = None,
+):
+    """
+    Paginated active incidents for the dashboard table.
+    """
+    if page < 1:
+        raise HTTPException(status_code=400, detail="Page must be >= 1")
+    if page_size < 1 or page_size > 500:
+        raise HTTPException(status_code=400, detail="Page size must be between 1 and 500")
+
+    try:
+        active_statuses = {
+            "DETECTED", "RCA_IN_PROGRESS", "RCA_COMPLETE",
+            "AWAITING_APPROVAL", "AWAITING_HUMAN_REVIEW", "FIX_IN_PROGRESS", "FIX_DEPLOYED",
+        }
+        
+        all_incidents = get_all_incidents(limit=page_size * page * 3)
+        
+        filtered_incidents = [
+            {
+                "incident_id": inc.get("incident_id"),
+                "message_guid": inc.get("message_guid"),
+                "iflow_id": inc.get("iflow_id"),
+                "error_type": inc.get("error_type"),
+                "status": inc.get("status"),
+                "created_at": inc.get("created_at"),
+                "last_seen": inc.get("last_seen"),
+                "occurrence_count": inc.get("occurrence_count", 1),
+                "rca_confidence": inc.get("rca_confidence"),
+            }
+            for inc in all_incidents
+            if inc.get("status") in active_statuses
+            and (status is None or str(inc.get("status")).upper() == status.upper())
+        ]
+        
+        total_count = len(filtered_incidents)
+        total_pages = (total_count + page_size - 1) // page_size if total_count > 0 else 1
+        
+        if page > total_pages and total_count > 0:
+            raise HTTPException(status_code=404, detail=f"Page {page} not found. Total pages: {total_pages}")
+        
+        start_idx = (page - 1) * page_size
+        paginated_incidents = filtered_incidents[start_idx : start_idx + page_size]
+        
+        return {
+            "count": len(paginated_incidents),
+            "total_count": total_count,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_previous": page > 1,
+            "incidents": paginated_incidents,
+            "timestamp": get_hana_timestamp(),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"[Dashboard] Paginated incidents error: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
 

@@ -371,10 +371,10 @@ export default function Pipeline() {
             <tbody>
               {incidents.map((inc) => (
                 <tr key={inc.incident_id}>
-                  <td className={styles.tdIflow}>
-                    {inc.iflow_name || inc.iflow_id || (
+                  <td className={styles.tdIflow} title={inc.iflow_name || inc.iflow_id || inc.message_guid || ""}>
+                    {inc.iflow_name || (
                       <span className={styles.tdIflowUnknown}>
-                        {inc.message_guid ? inc.message_guid.slice(0, 12) + "…" : "—"}
+                        {inc.message_guid ? "Resolving…" : "—"}
                       </span>
                     )}
                   </td>
