@@ -204,11 +204,31 @@ interface ToolsResponse {
   servers?: Record<string, Array<{ agent_tool_name?: string; mcp_tool_name?: string }>>;
 }
 
+// Fetch tool distribution once — tools don't change after startup.
+// Callers should use staleTime: 5+ minutes.
+export async function fetchToolDistribution(): Promise<Record<string, string[]>> {
+  const tools = await requestMaybe<ToolsResponse>(`${_BASE}/autonomous/tools`);
+  const serverEntries = Object.entries(tools?.servers ?? {});
+  const findTools = (...keywords: string[]): string[] => {
+    const hit = serverEntries.find(([server]) =>
+      keywords.some((kw) => server.toLowerCase().includes(kw)),
+    );
+    if (!hit) return [];
+    return hit[1].map((t) => t.agent_tool_name ?? t.mcp_tool_name ?? "").filter(Boolean);
+  };
+  return {
+    observer:   findTools("observer"),
+    classifier: findTools("classifier"),
+    rca:        findTools("rca"),
+    fixer:      findTools("fix"),
+    verifier:   findTools("verifier"),
+  };
+}
+
 export async function fetchPipelineStatus(): Promise<AgentStatus> {
-  const [autonomous, aem, tools] = await Promise.all([
+  const [autonomous, aem] = await Promise.all([
     request<AutonomousStatusResponse>(`${_BASE}/autonomous/status`),
     requestMaybe<AemStatusResponse>(`${_BASE}/aem/status`),
-    requestMaybe<ToolsResponse>(`${_BASE}/autonomous/tools`),
   ]);
 
   const running = autonomous.running;
@@ -220,15 +240,6 @@ export async function fetchPipelineStatus(): Promise<AgentStatus> {
     verifier: running ? "running" : "idle",
   };
 
-  const serverEntries = Object.entries(tools?.servers ?? {});
-  const findTools = (...keywords: string[]): string[] => {
-    const hit = serverEntries.find(([server]) =>
-      keywords.some((kw) => server.toLowerCase().includes(kw)),
-    );
-    if (!hit) return [];
-    return hit[1].map((t) => t.agent_tool_name ?? t.mcp_tool_name ?? "").filter(Boolean);
-  };
-
   return {
     pipeline_running: running,
     started_at: null,
@@ -237,13 +248,6 @@ export async function fetchPipelineStatus(): Promise<AgentStatus> {
     message: running ? "Autonomous pipeline running" : "Autonomous pipeline stopped",
     pipeline_type: "specialist",
     autonomous_running: running,
-    tool_distribution: {
-      observer: findTools("observer"),
-      classifier: findTools("classifier"),
-      rca: findTools("rca"),
-      fixer: findTools("fix"),
-      verifier: findTools("verifier"),
-    },
   };
 }
 

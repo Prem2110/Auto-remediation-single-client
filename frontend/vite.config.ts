@@ -28,5 +28,22 @@ export default defineConfig({
   build: {
     outDir: "dist",
     sourcemap: false,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // SAP UI5 WebComponents — largest chunk, loaded once and cached
+          "ui5-core":    ["@ui5/webcomponents", "@ui5/webcomponents-react"],
+          "ui5-fiori":   ["@ui5/webcomponents-fiori"],
+          // Recharts only needed on Dashboard
+          "recharts":    ["recharts"],
+          // React ecosystem
+          "react-vendor": ["react", "react-dom", "react-router-dom"],
+          // State / data-fetching
+          "query":       ["@tanstack/react-query", "zustand"],
+        },
+      },
+    },
+    // Warn if any single chunk exceeds 600 KB after splitting
+    chunkSizeWarningLimit: 600,
   },
 });

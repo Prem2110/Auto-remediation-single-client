@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   fetchPipelineStatus,
+  fetchToolDistribution,
   startPipeline,
   stopPipeline,
   fetchQueueStats,
@@ -77,20 +78,28 @@ export default function Pipeline() {
   const { data: pipelineData } = useQuery({
     queryKey: ["pipeline-status"],
     queryFn: fetchPipelineStatus,
-    refetchInterval: 4_000,
+    refetchInterval: 15_000,   // was 4s — status changes rarely
+  });
+
+  // Tools never change after startup — fetch once, cache for 10 minutes
+  const { data: toolDist } = useQuery({
+    queryKey: ["tool-distribution"],
+    queryFn: fetchToolDistribution,
+    staleTime: 10 * 60 * 1000,
+    refetchInterval: false,
   });
 
   const { data: queueStats } = useQuery({
     queryKey: ["queue-stats"],
     queryFn: fetchQueueStats,
-    refetchInterval: 8_000,
+    refetchInterval: 30_000,   // was 8s — queue depth doesn't need sub-second precision
     enabled: pipelineData?.pipeline_running ?? false,
   });
 
   const { data: traceData } = useQuery({
     queryKey: ["pipeline-trace"],
     queryFn: () => fetchPipelineTrace(30),
-    refetchInterval: 6_000,
+    refetchInterval: 15_000,   // was 6s
   });
 
   // ── Pipeline control ─────────────────────────────────────────────────────
@@ -126,7 +135,7 @@ export default function Pipeline() {
   const agentStatuses = pipelineData?.agents ?? {};
   const incidents: TraceIncident[] = (traceData?.incidents ?? []) as TraceIncident[];
   const isSpecialist = pipelineData?.pipeline_type === "specialist";
-  const toolDistribution = pipelineData?.tool_distribution;
+  const toolDistribution = toolDist ?? pipelineData?.tool_distribution;
 
   // ── AEM queue stats derivations ──────────────────────────────────────────
   const qs                  = (queueStats as Record<string, unknown>) ?? {};

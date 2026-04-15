@@ -334,7 +334,8 @@ export default function Observability() {
   const { data, isLoading, refetch, isFetching } = useQuery({
     queryKey: ["monitor-messages"],
     queryFn: fetchMonitorMessages,
-    refetchInterval: 10_000,
+    refetchInterval: 30_000,   // was 10s — each poll hits SAP CPI OData (slow)
+    staleTime: 20_000,
   });
 
   // Fetch tickets
@@ -364,13 +365,15 @@ export default function Observability() {
   const { data: pipelineData } = useQuery({
     queryKey: ["pipeline-status"],
     queryFn:  fetchPipelineStatus,
-    refetchInterval: 15_000,
+    refetchInterval: 30_000,
+    staleTime: 15_000,
   });
-  
+
   const { data: queueRaw } = useQuery({
     queryKey: ["queue-stats"],
     queryFn:  fetchQueueStats,
-    refetchInterval: 15_000,
+    refetchInterval: 30_000,
+    staleTime: 15_000,
     enabled:  pipelineData?.aem_connected ?? false,
   });
 
