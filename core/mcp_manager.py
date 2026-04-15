@@ -155,7 +155,7 @@ class MultiMCP:
                 opts = TRANSPORT_OPTIONS.get(name, {})
                 # Use a default-arg capture to avoid the Python closure-in-loop bug:
                 # without _opts=opts, all factories would share the final loop value of opts.
-                def factory(**kw, _opts=opts):
+                def factory(_opts=opts, **kw):
                     kw["verify"]  = _opts.get("verify", True)
                     kw["timeout"] = _opts.get("timeout", 30)
                     return httpx.AsyncClient(**kw)

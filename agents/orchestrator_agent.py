@@ -1214,7 +1214,11 @@ Rules:
         return {
             "source_type":    "AEM_QUEUE",
             "message_guid":   (msg.get("MessageGuid") or msg.get("message_guid") or msg.get("messageGuid") or ""),
-            "iflow_id":       (msg.get("IntegrationFlowName") or msg.get("iflow_id") or msg.get("iflowId") or msg.get("IntegrationFlowId") or ""),
+            # Only use human-readable name fields for iflow_id so the OData fallback
+            # triggers correctly when the name is absent. IntegrationFlowId is a SAP
+            # artifact GUID (e.g. "AGeNKJ3Th6Dl…") — store it as artifact_id, NOT here.
+            "iflow_id":       (msg.get("IntegrationFlowName") or msg.get("iflow_id") or msg.get("iflowId") or ""),
+            "artifact_id":    (msg.get("IntegrationFlowId") or msg.get("artifact_id") or ""),
             "sender":         msg.get("Sender") or msg.get("sender") or "",
             "receiver":       msg.get("Receiver") or msg.get("receiver") or "",
             "status":         msg.get("Status") or msg.get("status") or "FAILED",

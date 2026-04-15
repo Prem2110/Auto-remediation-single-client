@@ -631,9 +631,9 @@ async def get_incidents(status: Optional[str] = None, limit: int = 50):
         incidents = get_all_incidents(status=status, limit=limit)
         for inc in incidents:
             if not inc.get("iflow_name"):
+                # artifact_id is a SAP GUID — skip it; only use human-readable fields
                 inc["iflow_name"] = (
                     inc.get("iflow_id") or
-                    inc.get("artifact_id") or
                     inc.get("integration_flow_name") or
                     ""
                 )
