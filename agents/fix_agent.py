@@ -110,6 +110,7 @@ Must do:
         self._agent = await self._mcp.build_agent(
             tools=all_tools,
             system_prompt=system_prompt,
+            deployment_id=os.getenv("LLM_DEPLOYMENT_ID_FIX") or None,
         )
         logger.info(
             "[Fix] Agent ready — 1 local @tool + %d MCP tools.", len(mcp_tools)

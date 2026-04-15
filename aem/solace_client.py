@@ -44,10 +44,12 @@ Exports
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
 import threading
+import time
 from typing import Any, Dict, Optional
 
 from solace.messaging.config.solace_properties import (
@@ -59,6 +61,8 @@ from solace.messaging.config.transport_security_strategy import TLS
 from solace.messaging.messaging_service import MessagingService
 from solace.messaging.resources.queue import Queue
 from solace.messaging.resources.topic import Topic
+
+from core.constants import SOLACE_INBOUND_QUEUE_MAXSIZE
 
 logger = logging.getLogger(__name__)
 
@@ -94,9 +98,12 @@ class SolaceClient:
         self._publisher = None
         self._receiver_thread: Optional[threading.Thread] = None
         self._running:  bool = False
+        self._receiver_connected: bool = False   # True only while queue receiver is active
         self._loop:     Optional[asyncio.AbstractEventLoop] = None
-        self._inbound:  asyncio.Queue = asyncio.Queue()
+        self._inbound:  asyncio.Queue = asyncio.Queue(maxsize=SOLACE_INBOUND_QUEUE_MAXSIZE)
         self.messages_retrieved: int = 0   # total messages pulled from AEM queue
+        self.messages_published: int = 0   # total messages published to AEM topic
+        self.messages_dropped: int = 0
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -133,6 +140,7 @@ class SolaceClient:
         try:
             msg = self._service.message_builder().build(json.dumps(payload))
             self._publisher.publish(destination=Topic.of(topic), message=msg)
+            self.messages_published += 1
             logger.info("[Solace] Published  topic=%s", topic)
         except Exception as exc:
             logger.error("[Solace] Publish failed  topic=%s  error=%s", topic, exc)
@@ -155,43 +163,74 @@ class SolaceClient:
         logger.info("[Solace] Receiver thread started  queue=%s", _AEM_QUEUE)
 
     def _receiver_loop(self) -> None:
-        """Runs in background thread: open receiver → poll → feed asyncio.Queue."""
-        try:
-            svc  = _build_service()
-            svc.connect()
-            recv = (
-                svc.create_persistent_message_receiver_builder()
-                .build(Queue.durable_exclusive_queue(_AEM_QUEUE))
-            )
-            recv.start()
-            logger.info("[Solace] Queue receiver active  queue=%s", _AEM_QUEUE)
-        except Exception as exc:
-            logger.error("[Solace] Receiver startup failed: %s", exc)
-            self._running = False
-            return
+        """
+        Runs in background thread: open receiver → poll → feed asyncio.Queue.
+        Automatically reconnects with exponential backoff if the connection drops.
+        """
+        _RETRY_INITIAL = 2    # seconds before first retry
+        _RETRY_MAX     = 30   # cap backoff at 30 s
+        retry_delay    = _RETRY_INITIAL
 
         while self._running:
+            svc  = None
+            recv = None
             try:
-                msg = recv.receive_message(timeout=1000)   # 1-second poll
-                if msg is not None:
-                    raw = msg.get_payload_as_string()
-                    try:
-                        event = json.loads(raw)
-                    except Exception:
-                        event = {"raw_body": raw}
-                    asyncio.run_coroutine_threadsafe(
-                        self._inbound.put(event), self._loop
-                    )
-                    recv.ack(msg)
-                    self.messages_retrieved += 1
-            except Exception as exc:
-                logger.error("[Solace] Receiver poll error: %s", exc)
+                svc = _build_service()
+                svc.connect()
+                recv = (
+                    svc.create_persistent_message_receiver_builder()
+                    .build(Queue.durable_exclusive_queue(_AEM_QUEUE))
+                )
+                recv.start()
+                self._receiver_connected = True
+                retry_delay = _RETRY_INITIAL          # reset backoff after clean connect
+                logger.info("[Solace] Queue receiver active  queue=%s", _AEM_QUEUE)
 
-        try:
-            recv.terminate()
-            svc.disconnect()
-        except Exception:
-            pass
+                # ── inner poll loop ──────────────────────────────────────────
+                while self._running:
+                    try:
+                        msg = recv.receive_message(timeout=1000)   # 1-second poll
+                        if msg is not None:
+                            raw = msg.get_payload_as_string()
+                            if raw is None:
+                                raw_bytes = msg.get_payload_as_bytes()
+                                if raw_bytes:
+                                    raw = raw_bytes.decode("utf-8", errors="replace")
+                            try:
+                                event = json.loads(raw) if raw else {}
+                            except Exception:
+                                event = {"raw_body": raw}
+                            if event:
+                                self._enqueue_inbound(event)
+                                recv.ack(msg)
+                                self.messages_retrieved += 1
+                                logger.debug("[Solace] Message received  keys=%s", list(event.keys()))
+                            else:
+                                logger.warning("[Solace] Empty/unparseable message — skipping, ack anyway")
+                                recv.ack(msg)
+                    except Exception as exc:
+                        logger.error("[Solace] Receiver poll error: %s — reconnecting", exc)
+                        break   # drop to outer loop → reconnect
+
+            except Exception as exc:
+                logger.error(
+                    "[Solace] Receiver connection failed: %s — retrying in %ss",
+                    exc, retry_delay,
+                )
+            finally:
+                self._receiver_connected = False
+                for obj, method in ((recv, "terminate"), (svc, "disconnect")):
+                    if obj is not None:
+                        try:
+                            getattr(obj, method)()
+                        except Exception:
+                            pass
+
+            if self._running:
+                logger.info("[Solace] Receiver reconnecting in %ss…", retry_delay)
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, _RETRY_MAX)
+
         logger.info("[Solace] Receiver thread exited")
 
     async def get_message(self) -> Optional[Dict[str, Any]]:
@@ -200,6 +239,37 @@ class SolaceClient:
             return self._inbound.get_nowait()
         except asyncio.QueueEmpty:
             return None
+
+    async def _put_with_drop_oldest(self, event: Dict[str, Any]) -> None:
+        """Keep the queue bounded by dropping the oldest event on overflow."""
+        if self._inbound.full():
+            try:
+                self._inbound.get_nowait()
+                self.messages_dropped += 1
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            self._inbound.put_nowait(event)
+        except asyncio.QueueFull:
+            self.messages_dropped += 1
+            logger.warning("[Solace] Inbound queue still full; dropping newest event")
+
+    def _enqueue_inbound(self, event: Dict[str, Any]) -> None:
+        if self._loop is None:
+            self.messages_dropped += 1
+            logger.warning("[Solace] Event loop unavailable; dropping inbound event")
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._put_with_drop_oldest(event), self._loop
+        )
+        try:
+            future.result(timeout=2)
+        except concurrent.futures.TimeoutError:
+            self.messages_dropped += 1
+            logger.warning("[Solace] Timed out enqueuing inbound event; dropping event")
+        except Exception as exc:
+            self.messages_dropped += 1
+            logger.error("[Solace] Failed to enqueue inbound event: %s", exc)
 
     # ── Disconnect ────────────────────────────────────────────────────────────
 

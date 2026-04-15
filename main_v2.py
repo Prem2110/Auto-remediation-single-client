@@ -579,6 +579,14 @@ async def list_loaded_tools(server: Optional[str] = None):
 async def get_incidents(status: Optional[str] = None, limit: int = 50):
     try:
         incidents = get_all_incidents(status=status, limit=limit)
+        for inc in incidents:
+            if not inc.get("iflow_name"):
+                inc["iflow_name"] = (
+                    inc.get("iflow_id") or
+                    inc.get("artifact_id") or
+                    inc.get("integration_flow_name") or
+                    ""
+                )
         return {"incidents": incidents, "total": len(incidents)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

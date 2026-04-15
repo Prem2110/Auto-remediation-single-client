@@ -32,6 +32,7 @@ from db.database import (
     get_incident_by_id,
     get_incident_by_message_guid,
     get_all_incidents,
+    count_all_incidents,
     get_open_incident_by_signature,
     increment_incident_occurrence,
     get_escalation_tickets,
@@ -49,17 +50,72 @@ router = APIRouter(prefix="/smart-monitoring", tags=["Smart Monitoring"])
 # DEPENDENCY — lazy import avoids circular import with main.py
 # ─────────────────────────────────────────────────────────────────────────────
 
+class _MCPCompat:
+    """
+    Compatibility shim: maps the legacy monolithic mcp_manager interface used
+    throughout this file to the new split architecture (MultiMCP + ObserverAgent
+    + OrchestratorAgent) introduced in the refactored main.py.
+    """
+    def __init__(self, mcp, observer, orchestrator) -> None:
+        self._mcp         = mcp
+        self._observer    = observer
+        self._orchestrator = orchestrator
+
+    @property
+    def error_fetcher(self):
+        return self._observer.error_fetcher
+
+    @property
+    def llm(self):
+        return self._mcp.llm
+
+    @property
+    def _autonomous_running(self) -> bool:
+        return self._orchestrator._autonomous_running if self._orchestrator else False
+
+    def classify_error(self, error_message: str):
+        return self._orchestrator._classifier.classify_error(error_message)
+
+    @staticmethod
+    def incident_group_key(incident):
+        from agents.orchestrator_agent import OrchestratorAgent  # noqa: PLC0415
+        return OrchestratorAgent.incident_group_key(incident)
+
+    async def run_rca(self, incident):
+        return await self._orchestrator._rca.run_rca(incident)
+
+    async def execute_incident_fix(self, incident, human_approved: bool = False, deploy_only: bool = False):
+        return await self._orchestrator.execute_incident_fix(
+            incident, human_approved=human_approved, deploy_only=deploy_only
+        )
+
+    async def ask(self, query: str, user_id: str, session_id: str, timestamp: str):
+        return await self._orchestrator.ask(query, user_id, session_id, timestamp)
+
+    def get_tool_field_names(self, server: str, mcp_tool_name: str):
+        return self._mcp.get_tool_field_names(server, mcp_tool_name)
+
+    @property
+    def tools(self):
+        return self._mcp.tools
+
+
 def _get_mcp():
     """
-    Lazy-import the global mcp_manager from main.py at request time.
+    Lazy-import the global mcp from main.py at request time.
     This avoids a circular import at module-load time because smart_monitoring.py
     is imported by main.py.
     """
     import main as _main  # noqa: PLC0415
-    mgr = getattr(_main, "mcp_manager", None)
-    if mgr is None:
+    _mcp  = getattr(_main, "mcp_manager", None) or getattr(_main, "mcp", None)
+    _obs  = getattr(_main, "observer", None)
+    _orch = getattr(_main, "orchestrator", None)
+    if _mcp is None:
         raise HTTPException(status_code=503, detail="MCP manager not ready")
-    return mgr
+    # Legacy main_legacy.py already has full interface; new main.py needs the shim.
+    if not hasattr(_mcp, "error_fetcher"):
+        return _MCPCompat(_mcp, _obs, _orch)
+    return _mcp
 
 
 def _recommended_action(status: str, error_type: str) -> str:
@@ -99,6 +155,10 @@ class ChatRequest(BaseModel):
 
 class RetryFixRequest(BaseModel):
     user_id: str
+
+
+class ExplainErrorRequest(BaseModel):
+    user_id: str = "user"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -284,6 +344,51 @@ def _message_matches_filter_no_time(
     if artifact:
         iflow = str(raw.get("IntegrationFlowName", "") or "").lower()
         if artifact.lower() not in iflow:
+            return False
+
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DB-BASED FILTER HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _incident_matches_filter(
+    inc: Dict,
+    status: Optional[str],
+    time_range: Optional[str],
+    msg_id: Optional[str],
+    artifact: Optional[str],
+) -> bool:
+    """Return True if a DB incident passes UI filter criteria."""
+    inc_status = (inc.get("status") or "").upper()
+
+    if status:
+        s = status.upper()
+        # Legacy "FAILED" filter → show all incidents (they all originate from failures)
+        if s not in ("FAILED", "ALL", "") and s != inc_status:
+            return False
+
+    if msg_id:
+        q = msg_id.lower()
+        guid   = (inc.get("message_guid") or "").lower()
+        iflow  = (inc.get("iflow_id") or "").lower()
+        inc_id = (inc.get("incident_id") or "").lower()
+        if q not in guid and q not in iflow and q not in inc_id:
+            return False
+
+    if artifact:
+        iflow = (inc.get("iflow_id") or "").lower()
+        if artifact.lower() not in iflow:
+            return False
+
+    cutoff = _parse_time_range_cutoff(time_range)
+    if cutoff:
+        # Prefer last_seen (updated on every correlation) over log_end (frozen at
+        # the original AEM event time) so recently active incidents are always visible.
+        ts = str(inc.get("last_seen") or inc.get("log_end") or inc.get("created_at") or "")
+        dt = _parse_sap_timestamp(ts)
+        if dt and dt < cutoff:
             return False
 
     return True
@@ -787,61 +892,46 @@ def _rule_based_fix_steps(
 
 @router.get("/messages")
 async def list_messages(
-    status: Optional[str] = "FAILED",
+    status: Optional[str] = None,
     time_range: Optional[str] = "Last 24 Hours",
     type: Optional[str] = None,
     id: Optional[str] = None,
     time: Optional[str] = None,
     artifacts: Optional[str] = None,
     limit: int = 50,
-    mcp=Depends(_get_mcp),
 ):
     """
-    Fetch failed CPI messages from SAP Integration Suite and apply UI filters.
-    Maps to the left-panel 'Messages (n)' list in Smart Monitoring.
-    Each item includes a relative-time label and a flag indicating whether
-    AI diagnosis is already available in the local DB.
+    Fetch incidents from the local DB — no SAP CPI OData API calls.
+    All incidents originate from the AEM queue via the autonomous pipeline.
     """
-    try:
-        fetch_limit = max(limit * 3, 100)  # over-fetch so filters work
-        raw_errors = await mcp.error_fetcher.fetch_failed_messages(limit=fetch_limit)
-    except Exception as exc:
-        logger.error(f"[SM] fetch_failed_messages error: {exc}")
-        raw_errors = []
+    incidents = get_all_incidents(limit=limit * 3)
 
     messages: List[Dict] = []
-    for raw in raw_errors:
-        if not _message_matches_filter(raw, status, time_range, id, artifacts):
+    for inc in incidents:
+        if not _incident_matches_filter(inc, status, time_range, id, artifacts):
             continue
 
-        guid       = raw.get("MessageGuid", "")
-        iflow_name = raw.get("IntegrationFlowName", "")
-        log_end    = str(raw.get("LogEnd") or "")
-        log_start  = str(raw.get("LogStart") or "")
-
-        # Check DB for existing AI analysis
-        incident = get_incident_by_message_guid(guid) if guid else None
-        error_type = incident.get("error_type") if incident else None
-        if not error_type:
-            cl = mcp.classify_error(raw.get("CustomStatus", "") or "")
-            error_type = cl["error_type"]
+        inc_status = (inc.get("status") or "DETECTED").upper()
+        iflow_name = inc.get("iflow_id") or ""
+        log_end    = str(inc.get("log_end") or inc.get("last_seen") or inc.get("created_at") or "")
+        log_start  = str(inc.get("log_start") or inc.get("created_at") or "")
 
         messages.append({
-            "message_guid":    guid,
+            "message_guid":    inc.get("message_guid") or inc.get("incident_id"),
             "iflow_name":      iflow_name,
             "iflow_display":   iflow_name.replace("-", " – ").replace("_", " "),
-            "status":          raw.get("Status", "FAILED"),
-            "status_label":    "Failed",
+            "status":          inc_status,
+            "status_label":    inc_status.replace("_", " ").title(),
             "log_start":       _format_ts(log_start),
             "log_end":         _format_ts(log_end),
             "relative_time":   _relative_time(log_end),
-            "duration":        _extract_duration(raw),
-            "sender":          raw.get("Sender", ""),
-            "receiver":        raw.get("Receiver", ""),
-            "error_type":      error_type,
-            "has_rca":         incident is not None and bool(incident.get("root_cause")),
-            "incident_id":     incident.get("incident_id") if incident else None,
-            "incident_status": incident.get("status") if incident else None,
+            "duration":        "",
+            "sender":          inc.get("sender") or "",
+            "receiver":        inc.get("receiver") or "",
+            "error_type":      inc.get("error_type") or "",
+            "has_rca":         bool(inc.get("root_cause")),
+            "incident_id":     inc.get("incident_id"),
+            "incident_status": inc_status,
         })
 
         if len(messages) >= limit:
@@ -862,89 +952,59 @@ async def list_messages(
 
 @router.get("/messages/paginated")
 async def list_messages_paginated(
-    status: Optional[str] = "FAILED",
+    status: Optional[str] = None,
     type: Optional[str] = None,
     id: Optional[str] = None,
     artifacts: Optional[str] = None,
     page: int = 1,
     page_size: int = 50,
-    mcp=Depends(_get_mcp),
 ):
     """
-    Fetch failed CPI messages from SAP Integration Suite with pagination (no time_range filter).
-    Maps to the left-panel 'Messages (n)' list in Smart Monitoring.
-    Each item includes a relative-time label and a flag indicating whether
-    AI diagnosis is already available in the local DB.
-    
-    Pagination:
-    - page: Page number (1-indexed)
-    - page_size: Number of items per page (default: 50)
+    Fetch incidents from the local DB with pagination — no SAP CPI OData API calls.
     """
-    # Validate pagination parameters
     if page < 1:
         raise HTTPException(status_code=400, detail="Page must be >= 1")
     if page_size < 1 or page_size > 500:
         raise HTTPException(status_code=400, detail="Page size must be between 1 and 500")
 
-    try:
-        # Fetch more messages to ensure we have enough after filtering
-        fetch_limit = max(page_size * page * 3, 200)
-        raw_errors = await mcp.error_fetcher.fetch_failed_messages(limit=fetch_limit)
-    except Exception as exc:
-        logger.error(f"[SM] fetch_failed_messages error: {exc}")
-        raw_errors = []
+    incidents = get_all_incidents(limit=page_size * page * 3)
 
-    # Apply filters (without time_range)
     filtered_messages: List[Dict] = []
-    for raw in raw_errors:
-        if not _message_matches_filter_no_time(raw, status, id, artifacts):
+    for inc in incidents:
+        if not _incident_matches_filter(inc, status, None, id, artifacts):
             continue
 
-        guid       = raw.get("MessageGuid", "")
-        iflow_name = raw.get("IntegrationFlowName", "")
-        log_end    = str(raw.get("LogEnd") or "")
-        log_start  = str(raw.get("LogStart") or "")
-
-        # Check DB for existing AI analysis
-        incident = get_incident_by_message_guid(guid) if guid else None
-        error_type = incident.get("error_type") if incident else None
-        if not error_type:
-            cl = mcp.classify_error(raw.get("CustomStatus", "") or "")
-            error_type = cl["error_type"]
+        inc_status = (inc.get("status") or "DETECTED").upper()
+        iflow_name = inc.get("iflow_id") or ""
+        log_end    = str(inc.get("log_end") or inc.get("last_seen") or inc.get("created_at") or "")
+        log_start  = str(inc.get("log_start") or inc.get("created_at") or "")
 
         filtered_messages.append({
-            "message_guid":    guid,
+            "message_guid":    inc.get("message_guid") or inc.get("incident_id"),
             "iflow_name":      iflow_name,
             "iflow_display":   iflow_name.replace("-", " – ").replace("_", " "),
-            "status":          raw.get("Status", "FAILED"),
-            "status_label":    "Failed",
+            "status":          inc_status,
+            "status_label":    inc_status.replace("_", " ").title(),
             "log_start":       _format_ts(log_start),
             "log_end":         _format_ts(log_end),
             "relative_time":   _relative_time(log_end),
-            "duration":        _extract_duration(raw),
-            "sender":          raw.get("Sender", ""),
-            "receiver":        raw.get("Receiver", ""),
-            "error_type":      error_type,
-            "has_rca":         incident is not None and bool(incident.get("root_cause")),
-            "incident_id":     incident.get("incident_id") if incident else None,
-            "incident_status": incident.get("status") if incident else None,
+            "duration":        "",
+            "sender":          inc.get("sender") or "",
+            "receiver":        inc.get("receiver") or "",
+            "error_type":      inc.get("error_type") or "",
+            "has_rca":         bool(inc.get("root_cause")),
+            "incident_id":     inc.get("incident_id"),
+            "incident_status": inc_status,
         })
 
-    # Calculate pagination
     total_count = len(filtered_messages)
     total_pages = (total_count + page_size - 1) // page_size if total_count > 0 else 1
-    
-    # Validate page number
-    if page > total_pages and total_count > 0:
-        raise HTTPException(
-            status_code=404, 
-            detail=f"Page {page} not found. Total pages: {total_pages}"
-        )
 
-    # Slice for current page
+    if page > total_pages and total_count > 0:
+        raise HTTPException(status_code=404, detail=f"Page {page} not found. Total pages: {total_pages}")
+
     start_idx = (page - 1) * page_size
-    end_idx = start_idx + page_size
-    paginated_messages = filtered_messages[start_idx:end_idx]
+    paginated_messages = filtered_messages[start_idx: start_idx + page_size]
 
     return {
         "count":            len(paginated_messages),
@@ -979,56 +1039,22 @@ async def get_message_detail(
     If RCA has not yet run (and run_rca=true) it is triggered synchronously so
     the AI diagnosis is immediately available for the UI.
     """
-    # ── 1. Fetch raw SAP message ──────────────────────────────────────────
-    raw: Dict = {}
-    try:
-        raw_errors = await mcp.error_fetcher.fetch_failed_messages(limit=200)
-        raw = next((r for r in raw_errors if r.get("MessageGuid") == message_guid), {})
-    except Exception as exc:
-        logger.warning(f"[SM] Could not fetch raw message list: {exc}")
+    # ── 1. DB-first: fetch incident by message_guid ───────────────────────
+    incident = get_incident_by_message_guid(message_guid)
+    if not incident:
+        raise HTTPException(status_code=404, detail=f"Incident for GUID {message_guid!r} not found in DB")
 
-    if not raw:
-        # Try the direct metadata endpoint as fallback
+    # ── 2. Optionally trigger RCA if not yet done ─────────────────────────
+    if run_rca and incident.get("status") in {"DETECTED", "RCA_FAILED"} and not incident.get("root_cause"):
         try:
-            raw = await mcp.error_fetcher.fetch_message_metadata(message_guid) or {}
-        except Exception:
-            pass
+            await _ensure_incident_for_guid(message_guid, {}, {}, mcp, run_rca=True)
+            incident = get_incident_by_message_guid(message_guid) or incident
+        except Exception as exc:
+            logger.warning(f"[SM] RCA trigger skipped for {message_guid}: {exc}")
 
-    if not raw and not get_incident_by_message_guid(message_guid):
-        raise HTTPException(status_code=404, detail=f"Message GUID {message_guid!r} not found in SAP CPI")
-
-    # ── 2. Fetch full error text ──────────────────────────────────────────
-    error_detail: Dict = {}
-    try:
-        error_detail = await mcp.error_fetcher.fetch_error_details(message_guid) or {}
-    except Exception:
-        pass
-
-    # ── 3. Ensure incident + RCA ──────────────────────────────────────────
-    incident = await _ensure_incident_for_guid(
-        message_guid, raw, error_detail, mcp, run_rca=run_rca
-    )
-
-    # ── 4. Fetch SAP metadata for Properties / Artifact tabs ─────────────
-    metadata: Dict = {}
-    try:
-        metadata = await mcp.error_fetcher.fetch_message_metadata(message_guid) or {}
-    except Exception:
-        pass
-
-    # ── 5. Build response ─────────────────────────────────────────────────
-    iflow_id = (
-        incident.get("iflow_id")
-        or raw.get("IntegrationFlowName")
-        or metadata.get("IntegrationFlowName")
-        or message_guid
-    )
-    log_end = str(
-        incident.get("log_end")
-        or raw.get("LogEnd")
-        or metadata.get("LogEnd")
-        or ""
-    )
+    # ── 3. Build response from DB ─────────────────────────────────────────
+    iflow_id = incident.get("iflow_id") or message_guid
+    log_end  = str(incident.get("log_end") or incident.get("last_seen") or incident.get("created_at") or "")
 
     return {
         "message_guid":     message_guid,
@@ -1042,11 +1068,11 @@ async def get_message_detail(
         "incident_status":  incident.get("status"),
 
         # ── Tabs ──────────────────────────────────────────────────────────
-        "error_details":    _tab_error_details(incident, raw),
+        "error_details":    _tab_error_details(incident),
         "ai_recommendation": _tab_ai_recommendation(incident),
-        "properties":       _tab_properties(incident, metadata),
-        "artifact":         _tab_artifact(incident, metadata),
-        "attachments":      [],      # extendable with MPL attachment API
+        "properties":       _tab_properties(incident),
+        "artifact":         _tab_artifact(incident),
+        "attachments":      [],
         "history":          _tab_history(incident),
     }
 
@@ -1062,26 +1088,37 @@ async def analyze_message(
     Creates or refreshes the incident record.
     Returns the AI Recommendations tab data (diagnosis, fix, confidence, field changes).
     """
-    # Fetch raw message from SAP
-    raw: Dict = {}
-    try:
-        raw_errors = await mcp.error_fetcher.fetch_failed_messages(limit=200)
-        raw = next((r for r in raw_errors if r.get("MessageGuid") == message_guid), {})
-    except Exception:
-        pass
-
-    error_detail: Dict = {}
-    try:
-        error_detail = await mcp.error_fetcher.fetch_error_details(message_guid) or {}
-    except Exception:
-        pass
-
-    normalized     = mcp.error_fetcher.normalize(raw, error_detail)
-    classification = mcp.classify_error(normalized.get("error_message", ""))
-    normalized.update(classification)
-
-    # Upsert incident
+    # Use DB incident as primary source; fall back to CPI only if not in DB
     existing = get_incident_by_message_guid(message_guid)
+    if existing:
+        normalized = {
+            "message_guid": message_guid,
+            "iflow_id":     existing.get("iflow_id", ""),
+            "error_message": existing.get("error_message", ""),
+            "error_type":   existing.get("error_type", ""),
+            "sender":       existing.get("sender", ""),
+            "receiver":     existing.get("receiver", ""),
+            "log_start":    existing.get("log_start", ""),
+            "log_end":      existing.get("log_end", ""),
+        }
+        classification = mcp.classify_error(normalized.get("error_message", ""))
+        normalized.update(classification)
+    else:
+        # Fallback: fetch from CPI if not in DB
+        raw: Dict = {}
+        try:
+            raw_errors = await mcp.error_fetcher.fetch_failed_messages(limit=200)
+            raw = next((r for r in raw_errors if r.get("MessageGuid") == message_guid), {})
+        except Exception:
+            pass
+        error_detail: Dict = {}
+        try:
+            error_detail = await mcp.error_fetcher.fetch_error_details(message_guid) or {}
+        except Exception:
+            pass
+        normalized     = mcp.error_fetcher.normalize(raw, error_detail)
+        classification = mcp.classify_error(normalized.get("error_message", ""))
+        normalized.update(classification)
     if not existing:
         incident_id = str(uuid.uuid4())
         incident = {
@@ -1153,6 +1190,60 @@ async def analyze_message(
         "affected_component":  rca.get("affected_component", ""),
         "can_generate_fix":    True,
     }
+
+
+@router.post("/messages/{message_guid}/explain_error")
+async def explain_error(
+    message_guid: str,
+    req: ExplainErrorRequest,
+    mcp=Depends(_get_mcp),
+):
+    """
+    Lightweight LLM call that explains the error in plain English.
+    Returns a structured breakdown: category, summary, likely causes, recommended actions.
+    Does NOT run full RCA — useful as a quick first-look before triggering /analyze.
+    """
+    incident = get_incident_by_message_guid(message_guid)
+    if not incident:
+        raise HTTPException(status_code=404, detail=f"Incident for GUID {message_guid!r} not found")
+
+    error_message = (incident.get("error_message") or "").strip()
+    error_type    = (incident.get("error_type")    or "UNKNOWN").strip()
+    iflow_id      = (incident.get("iflow_id")      or "").strip()
+
+    prompt = f"""You are an SAP CPI integration expert. Analyze the following error and explain it clearly.
+
+iFlow: {iflow_id}
+Error Type: {error_type}
+Error Message: {error_message[:700]}
+
+Return ONLY valid JSON — no markdown fences, no extra text:
+{{
+  "error_category": "<one of: HTTP_ERROR, MAPPING_ERROR, CONNECTIVITY_ERROR, AUTH_ERROR, DATA_ERROR, TIMEOUT_ERROR, CONFIG_ERROR, RUNTIME_ERROR, UNKNOWN>",
+  "category_label": "<human-readable category, e.g. HTTP Backend Error>",
+  "summary": "<1–2 sentence plain-English summary of what went wrong>",
+  "what_happened": "<2–3 sentence technical explanation of the root failure, referencing the adapter/step if visible>",
+  "likely_causes": ["<cause 1>", "<cause 2>", "<cause 3>"],
+  "recommended_actions": ["<action 1>", "<action 2>", "<action 3>"]
+}}"""
+
+    try:
+        from langchain_core.messages import HumanMessage  # noqa: PLC0415
+        response = await mcp.llm.ainvoke([HumanMessage(content=prompt)])
+        answer   = response.content if hasattr(response, "content") else str(response)
+        clean    = re.sub(r"```(?:json)?|```", "", answer).strip()
+        parsed   = json.loads(clean)
+        return {
+            "error_category":       parsed.get("error_category", error_type),
+            "category_label":       parsed.get("category_label", error_type.replace("_", " ").title()),
+            "summary":              parsed.get("summary", ""),
+            "what_happened":        parsed.get("what_happened", ""),
+            "likely_causes":        parsed.get("likely_causes", []),
+            "recommended_actions":  parsed.get("recommended_actions", []),
+        }
+    except Exception as exc:
+        logger.warning("[SM] explain_error failed for %s: %s", message_guid, exc)
+        raise HTTPException(status_code=500, detail=f"Error explanation failed: {exc}")
 
 
 @router.post("/messages/{message_guid}/generate_fix_patch")
@@ -1819,23 +1910,12 @@ async def get_fix_status(incident_id: str):
 
 
 @router.get("/total-errors")
-async def get_total_errors(mcp=Depends(_get_mcp)):
+async def get_total_errors():
     """
-    Get the total count of failed messages from SAP Integration Suite.
-    Fetches the count directly from the SAP CPI OData API using the $count endpoint.
+    Get the total count of incidents from the local DB — no SAP CPI API call.
     """
-    try:
-        count = await mcp.error_fetcher.fetch_failed_messages_count()
-        return {
-            "total_failed_messages": count,
-            "status": "success",
-        }
-    except Exception as exc:
-        logger.error(f"[SM] total-errors fetch error: {exc}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to fetch total error count: {str(exc)}"
-        )
+    count = count_all_incidents()
+    return {"total_failed_messages": count, "status": "success"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

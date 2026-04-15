@@ -15,6 +15,7 @@ Exports:
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -112,6 +113,7 @@ Return exactly:
         self._agent = await _mcp.build_agent(
             tools=all_tools,
             system_prompt=system_prompt,
+            deployment_id=os.getenv("LLM_DEPLOYMENT_ID_RCA") or None,
         )
         logger.info(
             "[RCA] Agent ready — %d local tools + %d MCP tools.",

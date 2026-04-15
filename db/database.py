@@ -78,6 +78,7 @@ def _quote_identifier(identifier: str) -> str:
 
 def ensure_autonomous_incident_schema():
     required_columns = {
+        "iflow_id":              "NVARCHAR(500)",
         "incident_group_key":    "NVARCHAR(64)",
         "occurrence_count":      "INTEGER",
         "last_seen":             "NVARCHAR(64)",
@@ -96,9 +97,17 @@ def ensure_autonomous_incident_schema():
     try:
         conn = get_connection()
         cur  = conn.cursor()
-        cur.execute(
-            "SELECT COLUMN_NAME FROM SYS.TABLE_COLUMNS WHERE TABLE_NAME='AUTONOMOUS_INCIDENTS'"
-        )
+        schema = os.getenv("HANA_SCHEMA", "")
+        if schema:
+            cur.execute(
+                "SELECT COLUMN_NAME FROM SYS.TABLE_COLUMNS "
+                "WHERE TABLE_NAME='AUTONOMOUS_INCIDENTS' AND SCHEMA_NAME=?",
+                (schema,),
+            )
+        else:
+            cur.execute(
+                "SELECT COLUMN_NAME FROM SYS.TABLE_COLUMNS WHERE TABLE_NAME='AUTONOMOUS_INCIDENTS'"
+            )
         existing = {str(r[0]).lower() for r in cur.fetchall()}
         for column_name, column_type in required_columns.items():
             if column_name.lower() not in existing:
@@ -112,11 +121,19 @@ def ensure_autonomous_incident_schema():
 def _get_autonomous_incident_column_lookup() -> Dict[str, str]:
     lookup: Dict[str, str] = {}
     try:
-        conn = get_connection()
-        cur  = conn.cursor()
-        cur.execute(
-            "SELECT COLUMN_NAME FROM SYS.TABLE_COLUMNS WHERE TABLE_NAME='AUTONOMOUS_INCIDENTS'"
-        )
+        conn   = get_connection()
+        cur    = conn.cursor()
+        schema = os.getenv("HANA_SCHEMA", "")
+        if schema:
+            cur.execute(
+                "SELECT COLUMN_NAME FROM SYS.TABLE_COLUMNS "
+                "WHERE TABLE_NAME='AUTONOMOUS_INCIDENTS' AND SCHEMA_NAME=?",
+                (schema,),
+            )
+        else:
+            cur.execute(
+                "SELECT COLUMN_NAME FROM SYS.TABLE_COLUMNS WHERE TABLE_NAME='AUTONOMOUS_INCIDENTS'"
+            )
         for row in cur.fetchall():
             name = str(row[0])
             lookup[name.lower()] = name
@@ -657,9 +674,11 @@ def increment_incident_occurrence(incident_id: str, message_guid: Optional[str] 
         incident = get_incident_by_id(incident_id)
         if not incident:
             return
+        _now = last_seen or datetime.now(UTC).isoformat()
         updates = {
             "occurrence_count": int(incident.get("occurrence_count") or 1) + 1,
-            "last_seen": last_seen or datetime.now(UTC).isoformat(),
+            "last_seen":        _now,
+            "log_end":          _now,   # keep log_end fresh so time filters don't hide active incidents
         }
         if message_guid:
             updates["message_guid"] = message_guid

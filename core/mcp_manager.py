@@ -19,6 +19,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Type
 
 import httpx
@@ -35,6 +36,8 @@ from core.constants import (
     SERVER_ROUTING_GUIDE,
     MAX_RETRIES,
     MEMORY_LIMIT,
+    MEMORY_SESSION_TTL_SECONDS,
+    MAX_MEMORY_SESSIONS,
     GROOVY_STRIPE_HTTP_ADAPTER,
     GROOVY_WOOCOMMERCE_HTTP_ADAPTER,
     CPI_IFLOW_GROOVY_RULES,
@@ -50,8 +53,8 @@ logger = logging.getLogger(__name__)
 # LLM FACTORY
 # ─────────────────────────────────────────────
 
-def create_llm() -> ChatOpenAI:
-    dep = os.getenv("LLM_DEPLOYMENT_ID")
+def create_llm(deployment_id: Optional[str] = None) -> ChatOpenAI:
+    dep = deployment_id or os.getenv("LLM_DEPLOYMENT_ID")
     if not dep:
         raise RuntimeError("LLM_DEPLOYMENT_ID missing in .env")
     return ChatOpenAI(deployment_id=dep, temperature=0)
@@ -135,6 +138,7 @@ class MultiMCP:
         self.llm      = create_llm()
         self.agent    = None          # populated by build_agent() with no args
         self.memory:  Dict[str, List[Dict]] = {}
+        self._memory_last_seen: Dict[str, float] = {}
 
     # ── safe tool name ───────────────────────
 
@@ -255,6 +259,7 @@ class MultiMCP:
         self,
         tools: Optional[List[MCPTool]] = None,
         system_prompt: Optional[str] = None,
+        deployment_id: Optional[str] = None,
     ):
         """
         Create a LangChain agent.
@@ -301,8 +306,9 @@ Execution policy:
   explicitly instructs you to fix and deploy autonomously.
 """
 
+        llm = create_llm(deployment_id) if deployment_id else self.llm
         agent = create_agent(
-            model=self.llm,
+            model=llm,
             tools=agent_tools,
             system_prompt=system_prompt,
         )
@@ -427,10 +433,38 @@ Execution policy:
 
     # ── memory ───────────────────────────────
 
+    def cleanup_memory(self, now: Optional[float] = None) -> None:
+        """Remove stale sessions and cap the total remembered session count."""
+        if not self.memory:
+            return
+
+        current = now if now is not None else time.time()
+        expired_sessions = [
+            session_id
+            for session_id, last_seen in self._memory_last_seen.items()
+            if current - last_seen > MEMORY_SESSION_TTL_SECONDS
+        ]
+        for session_id in expired_sessions:
+            self.memory.pop(session_id, None)
+            self._memory_last_seen.pop(session_id, None)
+
+        overflow = len(self.memory) - MAX_MEMORY_SESSIONS
+        if overflow > 0:
+            oldest_sessions = sorted(
+                self.memory,
+                key=lambda session_id: self._memory_last_seen.get(session_id, 0.0),
+            )[:overflow]
+            for session_id in oldest_sessions:
+                self.memory.pop(session_id, None)
+                self._memory_last_seen.pop(session_id, None)
+
     def update_memory(self, session_id: str, user: str, assistant: str):
         """Append a user/assistant exchange to the rolling per-session memory."""
+        now = time.time()
+        self.cleanup_memory(now)
         session_memory = self.memory.setdefault(session_id, [])
         session_memory.append({"role": "user",      "content": user})
         session_memory.append({"role": "assistant", "content": assistant})
         if len(session_memory) > MEMORY_LIMIT:
             self.memory[session_id] = session_memory[-MEMORY_LIMIT:]
+        self._memory_last_seen[session_id] = now

@@ -95,6 +95,7 @@ from db.database import (
     get_incident_by_id,
     get_incident_by_message_guid,
     get_pending_approvals,
+    get_escalation_tickets,
     get_similar_patterns,
     get_testsuite_log_entries,
     get_xsd_files_by_session,
@@ -153,13 +154,17 @@ async def lifespan(app: FastAPI):
             logger.info("[Startup] Initialising MCP servers in background…")
             await mcp.connect()
             await mcp.discover_tools()
-            await mcp.build_agent()                  # full-toolset shared agent
-            await observer.build_agent()             # observer: fetch_failed_messages + mark tools
-            await orchestrator._classifier.build_agent(mcp)  # classifier: lookup_error_pattern + get-iflow
-            await _rca.build_agent()                 # rca: vector_store_notes + cross_iflow + MCP
-            await _fix.build_agent()                 # fix: validate_iflow_xml + 3 MCP tools
-            await _verifier.build_agent()            # verifier: runtime_status + mcp_testing
-            await orchestrator.build_agent(observer=observer)  # orchestrator: 5 @tool wrappers
+            await mcp.build_agent()                  # full-toolset shared agent (must be first)
+
+            # Build all specialist agents in parallel — they are independent of each other
+            await asyncio.gather(
+                observer.build_agent(),
+                orchestrator._classifier.build_agent(mcp),
+                _rca.build_agent(),
+                _fix.build_agent(),
+                _verifier.build_agent(),
+            )
+            await orchestrator.build_agent(observer=observer)  # depends on all above being ready
 
             # ── AEM inbound webhook subscription ──────────────────────────────
             async def _on_observed_event(event: dict) -> None:
@@ -174,14 +179,10 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.error("[Startup] Agent initialisation failed: %s", exc)
 
-        # Start autonomous loop OUTSIDE the try/except so it always runs,
-        # even if some agents failed to build (MCP timeout, network issue etc.)
+        # Orchestrator loop was already started before _init_background() ran.
+        # Log confirmation that all agents are now ready for full pipeline processing.
         if AUTONOMOUS_ENABLED:
-            try:
-                orchestrator.start()
-                logger.info("[Startup] Orchestrator queue-polling loop started.")
-            except Exception as exc:
-                logger.error("[Startup] Orchestrator start failed: %s", exc)
+            logger.info("[Startup] All agents ready — orchestrator loop already running.")
 
     # Connect Solace and start receiver BEFORE agents init —
     # so the queue consumer is live regardless of agent build success/failure.
@@ -195,6 +196,16 @@ async def lifespan(app: FastAPI):
                 logger.info("[Startup] Solace receiver thread started — consuming from queue.")
         except Exception as exc:
             logger.error("[Startup] Solace connect/receiver failed: %s", exc)
+
+    # Start the orchestrator loop immediately so the UI shows "Running" from boot.
+    # Agents finish building in the background — any messages that arrive before
+    # build completes are buffered in solace_client._inbound and processed once ready.
+    if AUTONOMOUS_ENABLED:
+        try:
+            orchestrator.start()
+            logger.info("[Startup] Orchestrator loop started early — agents still initialising.")
+        except Exception as exc:
+            logger.error("[Startup] Early orchestrator start failed: %s", exc)
 
     asyncio.create_task(_init_background())
     logger.info("[Startup] FastAPI ready — agents initialising in background.")
@@ -617,6 +628,14 @@ async def list_loaded_tools(server: Optional[str] = None):
 async def get_incidents(status: Optional[str] = None, limit: int = 50):
     try:
         incidents = get_all_incidents(status=status, limit=limit)
+        for inc in incidents:
+            if not inc.get("iflow_name"):
+                inc["iflow_name"] = (
+                    inc.get("iflow_id") or
+                    inc.get("artifact_id") or
+                    inc.get("integration_flow_name") or
+                    ""
+                )
         return {"incidents": incidents, "total": len(incidents)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -782,6 +801,15 @@ async def list_pending_approvals():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/autonomous/tickets")
+async def list_escalation_tickets(status: Optional[str] = None, limit: int = 50):
+    try:
+        tickets = get_escalation_tickets(status=status, limit=limit)
+        return {"tickets": tickets}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 # ─────────────────────────────────────────────
 # MANUAL TRIGGER + TEST INCIDENT
 # ─────────────────────────────────────────────
@@ -881,16 +909,22 @@ async def aem_status():
     # Single GROUP BY — one round-trip, no row data fetched
     stage_counts = get_stage_counts()
 
-    messages_retrieved = solace_client.messages_retrieved if solace_client else 0
+    messages_retrieved   = solace_client.messages_retrieved        if solace_client else 0
+    messages_published   = solace_client.messages_published        if solace_client else 0
+    messages_dropped     = solace_client.messages_dropped          if solace_client else 0
+    receiver_connected   = solace_client._receiver_connected       if solace_client else False
 
     return {
         "aem_enabled":        aem_enabled,
+        "receiver_connected": receiver_connected,
         "queue_name":         queue_name,
         "queue_depth":        queue_depth,
         "semp_error":         semp_error,
         "stage_counts":       stage_counts,
         "total_incidents":    total_incidents,
         "messages_retrieved": messages_retrieved,
+        "messages_published": messages_published,
+        "messages_dropped":   messages_dropped,
     }
 
 

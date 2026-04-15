@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 
 from typing import Any, Dict, List, Optional
@@ -48,6 +49,7 @@ from core.constants import (
     AUTO_FIX_CONFIDENCE,
     BURST_DEDUP_WINDOW_SECONDS,
     CPI_IFLOW_GROOVY_RULES,
+    LOCAL_QUEUE_MAXSIZE,
     MAX_CONSECUTIVE_FAILURES,
     PATTERN_MIN_SUCCESS_COUNT,
     REMEDIATION_POLICIES,
@@ -57,7 +59,7 @@ from core.constants import (
     TRANSIENT_ERROR_MARKERS,
     _STATUS_ACTION_HINTS,
 )
-from core.state import FIX_PROGRESS
+from core.state import FIX_PROGRESS, cleanup_fix_progress
 from db.database import (
     create_escalation_ticket,
     create_incident,
@@ -100,7 +102,7 @@ class OrchestratorAgent:
         # Autonomous queue-polling loop
         self._autonomous_task:    Optional[asyncio.Task] = None
         self._autonomous_running: bool                   = False
-        self._local_queue:        asyncio.Queue          = asyncio.Queue()
+        self._local_queue:        asyncio.Queue          = asyncio.Queue(maxsize=LOCAL_QUEUE_MAXSIZE)
 
     def set_observer(self, observer) -> None:
         """Inject the ObserverAgent reference for the orchestrator LangChain agent."""
@@ -299,6 +301,7 @@ Rules:
         status: str = "FIX_IN_PROGRESS",
         **context: object,
     ) -> None:
+        cleanup_fix_progress()
         entry = FIX_PROGRESS.get(incident_id, {"steps_done": [], "started_at": get_hana_timestamp()})
         if step_index > 1 and entry.get("current_step"):
             entry["steps_done"].append(entry["current_step"])
@@ -308,6 +311,7 @@ Rules:
             "step_index":   step_index,
             "total_steps":  total_steps,
             "updated_at":   get_hana_timestamp(),
+            "_updated_epoch": time.time(),
         })
         for k, v in context.items():
             if v is not None or k not in entry:
@@ -407,14 +411,6 @@ Rules:
             logger.info("[Gate] AUTO-FIX (%.2f) → %s", confidence, incident["iflow_id"])
             fix_result   = await self._fix.apply_fix(incident, rca)
             fix_summary  = fix_result.get("summary", "")
-            # ── Queue stage: fix ──────────────────────────────────────────────
-            await self._publish_to_aem_queue("fix", incident.get("incident_id", ""), {
-                "iflow_id":       incident.get("iflow_id"),
-                "fix_applied":    fix_result.get("fix_applied"),
-                "deploy_success": fix_result.get("deploy_success"),
-                "success":        fix_result.get("success"),
-                "summary":        fix_summary[:300],
-            })
             retry_result = None
             if fix_result["success"] and policy.get("replay_after_fix"):
                 retry_result = await self._verifier.retry_failed_message(incident)
@@ -432,12 +428,15 @@ Rules:
                 "resolved_at":          get_hana_timestamp() if _resolved else None,
                 "verification_status":  "VERIFIED" if _resolved else "PENDING",
             })
-            # ── Queue stage: verified ─────────────────────────────────────────
-            await self._publish_to_aem_queue("verified", incident.get("incident_id", ""), {
-                "iflow_id": incident.get("iflow_id"),
-                "status":   final_status,
-                "resolved": _resolved,
-            })
+            # ── Dispatch verification directly — no Solace round-trip ─────────
+            asyncio.create_task(self._handle_fix({
+                "incident_id":    incident.get("incident_id", ""),
+                "iflow_id":       incident.get("iflow_id"),
+                "fix_applied":    fix_result.get("fix_applied"),
+                "deploy_success": fix_result.get("deploy_success"),
+                "success":        fix_result.get("success"),
+                "summary":        fix_summary[:300],
+            }))
             upsert_fix_pattern({
                 "error_signature": self._classifier.error_signature(
                     incident["iflow_id"], rca.get("error_type", ""), incident.get("error_message", "")
@@ -543,14 +542,15 @@ Rules:
             "rca_confidence":     rca.get("confidence", 0.0),
             "affected_component": rca.get("affected_component", ""),
         })
-        await self._publish_to_aem_queue("rca", incident_id, {
+        asyncio.create_task(self.on_rca_event({
+            "incident_id":        incident_id,
             "root_cause":         rca.get("root_cause", ""),
             "proposed_fix":       rca.get("proposed_fix", ""),
             "confidence":         rca.get("confidence", 0.0),
             "error_type":         rca.get("error_type", ""),
             "affected_component": rca.get("affected_component", ""),
-        })
-        logger.info("[Orchestrator] incident=%s RCA complete, queued 'rca' stage", incident_id)
+        }))
+        logger.info("[Orchestrator] incident=%s RCA complete, dispatching remediation directly", incident_id)
 
     async def on_rca_event(self, event: Dict[str, Any]) -> None:
         """
@@ -590,9 +590,13 @@ Rules:
         )
 
         # ── Existing open incident for same signature ─────────────────────────
-        existing_sig = get_open_incident_by_signature(
-            normalized.get("iflow_id", ""),
-            normalized.get("error_type", ""),
+        # Skip signature dedup when iflow_id is blank or a placeholder — without
+        # a real iFlow name, every unknown error would collapse into one row.
+        _iflow_for_dedup = normalized.get("iflow_id", "")
+        _skip_sig_dedup  = _iflow_for_dedup.lower() in ("", "unknown_iflow", "unknown", "n/a")
+        existing_sig = (
+            None if _skip_sig_dedup
+            else get_open_incident_by_signature(_iflow_for_dedup, normalized.get("error_type", ""))
         )
         if existing_sig:
             consec = int(existing_sig.get("consecutive_failures") or 0)
@@ -666,12 +670,13 @@ Rules:
         logger.info("[Autonomous] New incident: %s | %s | %s",
                     incident_id, normalized.get("iflow_id", ""), normalized.get("error_type", ""))
 
-        # ── Queue: publish "classified" → loop picks it up → on_classified_event
-        await self._publish_to_aem_queue("classified", incident_id, {
-            "error_type": clf.get("error_type"),
-            "confidence": clf.get("confidence"),
-            "tags":       clf.get("tags", []),
-        })
+        # ── Dispatch directly — no Solace round-trip needed for in-process stages
+        asyncio.create_task(self.on_classified_event({
+            "incident_id": incident_id,
+            "error_type":  clf.get("error_type"),
+            "confidence":  clf.get("confidence"),
+            "tags":        clf.get("tags", []),
+        }))
         return "QUEUED"
 
     # ────────────────────────────────────────────
@@ -1125,6 +1130,7 @@ Rules:
         if self._mcp.agent is None:
             raise RuntimeError("MCP agent not ready — MCP servers may still be initialising.")
 
+        self._mcp.cleanup_memory()
         user_memory = self._mcp.memory.setdefault(session_id, [])
         tracker     = TestExecutionTracker(user_id, query, timestamp)
         logger_cb   = StepLogger(tracker)
@@ -1195,7 +1201,16 @@ Rules:
 
     @staticmethod
     def _normalize_aem_message(msg: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize a raw AEM / SAP CPI queue message to the standard incident dict."""
+        """
+        Normalize a raw AEM / SAP CPI queue message to the standard incident dict.
+
+        The FailedLogscapturing_Schedule iFlow publishes SAP multimap XML, not JSON.
+        The XML body contains the error text and embeds the MPL ID (message GUID) as:
+            'The MPL ID for the failed message is : <GUID>'
+        We extract it so the OData fallback in _route_stage can resolve the iFlow name.
+        """
+        raw_body   = msg.get("raw_body") or ""
+
         return {
             "source_type":    "AEM_QUEUE",
             "message_guid":   (msg.get("MessageGuid") or msg.get("message_guid") or msg.get("messageGuid") or ""),
@@ -1205,7 +1220,7 @@ Rules:
             "status":         msg.get("Status") or msg.get("status") or "FAILED",
             "log_start":      msg.get("LogStart") or msg.get("log_start") or "",
             "log_end":        msg.get("LogEnd") or msg.get("log_end") or "",
-            "error_message":  (msg.get("error_message") or msg.get("ErrorMessage") or msg.get("errorMessage") or msg.get("CustomStatus") or msg.get("Description") or msg.get("raw_body") or ""),
+            "error_message":  (msg.get("error_message") or msg.get("ErrorMessage") or msg.get("errorMessage") or msg.get("CustomStatus") or msg.get("Description") or raw_body or ""),
             "correlation_id": msg.get("CorrelationId") or msg.get("correlation_id") or "",
             "error_type":     msg.get("error_type") or msg.get("errorType") or "",
         }
@@ -1234,8 +1249,29 @@ Rules:
             await solace_client.publish(_AEM_OBSERVER_TOPIC, message)
             logger.info("[AEM] Published stage='%s' incident='%s'", stage, incident_id)
         else:
-            await self._local_queue.put(message)
+            await self._put_local_queue_message(message)
             logger.debug("[AEM] Local queue: stage='%s' incident='%s'", stage, incident_id)
+
+    async def _put_local_queue_message(self, message: Dict[str, Any]) -> None:
+        """Keep the in-process queue bounded by dropping the oldest message on overflow."""
+        if self._local_queue.full():
+            try:
+                dropped = self._local_queue.get_nowait()
+                logger.warning(
+                    "[AEM] Local queue full; dropped oldest stage='%s' incident='%s'",
+                    dropped.get("stage", "observed"),
+                    dropped.get("incident_id", ""),
+                )
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            self._local_queue.put_nowait(message)
+        except asyncio.QueueFull:
+            logger.warning(
+                "[AEM] Local queue still full; dropping newest stage='%s' incident='%s'",
+                message.get("stage", "observed"),
+                message.get("incident_id", ""),
+            )
 
     # ────────────────────────────────────────────
     # PIPELINE STAGE ROUTING
@@ -1249,7 +1285,61 @@ Rules:
         stage = message.get("stage", "observed")
         try:
             if stage == "observed":
+                # ── SAP multimap XML: one Solace message = N <Error> blocks ──
+                raw_body = message.get("raw_body", "")
+                if raw_body and raw_body.strip().startswith("<"):
+                    error_blocks = re.findall(r"<Error>(.*?)</Error>", raw_body, re.DOTALL)
+                    if error_blocks:
+                        logger.info("[Orchestrator] SAP multimap XML — splitting %d error block(s)", len(error_blocks))
+                        for block in error_blocks:
+                            guid_m = re.search(r"MPL ID for the failed message is\s*:\s*(\S+)", block)
+                            guid   = guid_m.group(1).strip() if guid_m else ""
+                            clean  = re.sub(r"The MPL ID for the failed message is\s*:\s*\S+", "", block).strip()
+                            inc = {
+                                "source_type":    "AEM_QUEUE",
+                                "message_guid":   guid,
+                                "iflow_id":       "",
+                                "sender":         "",
+                                "receiver":       "",
+                                "status":         "FAILED",
+                                "log_start":      "",
+                                "log_end":        "",
+                                "error_message":  clean,
+                                "correlation_id": "",
+                                "error_type":     "",
+                            }
+                            if guid and self._observer:
+                                try:
+                                    meta = await self._observer.error_fetcher.fetch_message_metadata(guid)
+                                    if meta.get("IntegrationFlowName"):
+                                        inc["iflow_id"]  = meta["IntegrationFlowName"]
+                                        inc["sender"]    = meta.get("Sender", "")
+                                        inc["receiver"]  = meta.get("Receiver", "")
+                                        inc["log_start"] = meta.get("LogStart", "")
+                                        inc["log_end"]   = meta.get("LogEnd", "")
+                                        logger.info("[Orchestrator] Resolved iflow=%s for guid=%s",
+                                                    inc["iflow_id"], guid)
+                                except Exception as _e:
+                                    logger.warning("[Orchestrator] OData fallback failed guid=%s: %s", guid, _e)
+                            await self.process_detected_error(inc)
+                        return  # all blocks dispatched — skip single-message path below
+
                 normalized = self._normalize_aem_message(message)
+                _iflow_placeholder = normalized["iflow_id"].lower() in ("", "unknown_iflow", "unknown", "n/a")
+                if _iflow_placeholder and normalized["message_guid"] and self._observer:
+                    try:
+                        meta = await self._observer.error_fetcher.fetch_message_metadata(normalized["message_guid"])
+                        if meta.get("IntegrationFlowName"):
+                            normalized["iflow_id"]  = meta["IntegrationFlowName"]
+                            normalized["sender"]    = meta.get("Sender", "") or normalized["sender"]
+                            normalized["receiver"]  = meta.get("Receiver", "") or normalized["receiver"]
+                            normalized["log_start"] = meta.get("LogStart", "") or normalized["log_start"]
+                            normalized["log_end"]   = meta.get("LogEnd", "") or normalized["log_end"]
+                            logger.info("[Orchestrator] iflow_id resolved via OData: %s (guid=%s)",
+                                        normalized["iflow_id"], normalized["message_guid"])
+                    except Exception as _odata_exc:
+                        logger.warning("[Orchestrator] OData iflow fallback failed (guid=%s): %s",
+                                       normalized["message_guid"], _odata_exc)
                 await self.process_detected_error(normalized)
             elif stage == "classified":
                 await self.on_classified_event(message)
@@ -1262,6 +1352,14 @@ Rules:
             else:
                 logger.warning("[Orchestrator] Unknown stage '%s' — treating as new error", stage)
                 normalized = self._normalize_aem_message(message)
+                _iflow_placeholder = normalized["iflow_id"].lower() in ("", "unknown_iflow", "unknown", "n/a")
+                if _iflow_placeholder and normalized["message_guid"] and self._observer:
+                    try:
+                        meta = await self._observer.error_fetcher.fetch_message_metadata(normalized["message_guid"])
+                        if meta.get("IntegrationFlowName"):
+                            normalized["iflow_id"] = meta["IntegrationFlowName"]
+                    except Exception:
+                        pass
                 await self.process_detected_error(normalized)
         except Exception as exc:
             logger.error("[Orchestrator] Stage '%s' handler error: %s", stage, exc)
@@ -1285,11 +1383,13 @@ Rules:
             "verification_status": "VERIFIED" if _resolved else "FAILED",
             "resolved_at":         get_hana_timestamp() if _resolved else None,
         })
-        await self._publish_to_aem_queue("verified", incident_id, {
-            "iflow_id": incident.get("iflow_id"),
-            "status":   final_status,
-            "resolved": _resolved,
-            "summary":  result.get("summary", ""),
+        # ── Dispatch terminal stage directly — no Solace round-trip ──────────
+        await self._handle_verified({
+            "incident_id": incident_id,
+            "iflow_id":    incident.get("iflow_id"),
+            "status":      final_status,
+            "resolved":    _resolved,
+            "summary":     result.get("summary", ""),
         })
         logger.info("[Orchestrator:fix] incident=%s verification=%s", incident_id, final_status)
 
@@ -1305,24 +1405,39 @@ Rules:
     # ────────────────────────────────────────────
 
     async def _autonomous_loop(self) -> None:
-        from core.constants import POLL_INTERVAL_SECONDS  # noqa: PLC0415
-
         mode = f"Solace Web Messaging  queue={_AEM_OBSERVER_QUEUE}" if _AEM_ENABLED else "local in-process queue"
         logger.info("[Orchestrator] Autonomous loop started  mode=%s", mode)
 
+        _BATCH_SIZE          = 20    # max messages to drain per tick
+        _IDLE_SLEEP          = 0.1   # seconds to sleep when queue is empty
+        _TIMEOUT_CHECK_EVERY = 300   # run approval-timeout sweep every 5 minutes
+        _last_timeout_check  = 0.0
+
         while self._autonomous_running:
             try:
-                # Periodic approval-timeout sweep
-                if self._observer:
+                # Approval-timeout sweep — run every 5 minutes, not every tick
+                now = asyncio.get_event_loop().time()
+                if self._observer and (now - _last_timeout_check) >= _TIMEOUT_CHECK_EVERY:
                     try:
                         await self._observer._check_pending_approval_timeouts()
+                        _last_timeout_check = now
                     except Exception as exc:
                         logger.warning("[Orchestrator] Timeout check error: %s", exc)
 
-                # Drain one message per tick
-                msg = await self._fetch_from_aem_queue()
-                if msg is not None:
+                # Drain up to _BATCH_SIZE messages per tick — no idle sleep when busy
+                drained = 0
+                while drained < _BATCH_SIZE:
+                    msg = await self._fetch_from_aem_queue()
+                    if msg is None:
+                        break
                     asyncio.create_task(self._route_stage(msg))
+                    drained += 1
+
+                # Sleep only when the queue was empty; yield immediately if busy
+                if drained == 0:
+                    await asyncio.sleep(_IDLE_SLEEP)
+                else:
+                    await asyncio.sleep(0)   # yield to event loop without blocking
 
             except asyncio.CancelledError:
                 break
@@ -1330,8 +1445,6 @@ Rules:
                 logger.error("[Orchestrator] Loop error: %s", exc)
                 await asyncio.sleep(5)
                 continue
-
-            await asyncio.sleep(1)
 
         logger.info("[Orchestrator] Autonomous loop stopped.")
 

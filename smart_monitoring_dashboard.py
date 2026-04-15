@@ -49,13 +49,33 @@ router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 # DEPENDENCY — lazy import MCP manager
 # ─────────────────────────────────────────────────────────────────────────────
 
+class _MCPCompat:
+    """Shim: maps legacy mcp_manager interface to new MultiMCP + ObserverAgent architecture."""
+    def __init__(self, mcp, observer, orchestrator) -> None:
+        self._mcp          = mcp
+        self._observer     = observer
+        self._orchestrator = orchestrator
+
+    @property
+    def error_fetcher(self):
+        return self._observer.error_fetcher
+
+    @property
+    def _autonomous_running(self) -> bool:
+        return self._orchestrator._autonomous_running if self._orchestrator else False
+
+
 def _get_mcp():
-    """Lazy-import the global mcp_manager from main.py at request time."""
+    """Lazy-import the global mcp from main.py at request time."""
     import main as _main  # noqa: PLC0415
-    mgr = getattr(_main, "mcp_manager", None)
-    if mgr is None:
+    _mcp  = getattr(_main, "mcp_manager", None) or getattr(_main, "mcp", None)
+    _obs  = getattr(_main, "observer", None)
+    _orch = getattr(_main, "orchestrator", None)
+    if _mcp is None:
         raise HTTPException(status_code=503, detail="MCP manager not ready")
-    return mgr
+    if not hasattr(_mcp, "error_fetcher"):
+        return _MCPCompat(_mcp, _obs, _orch)
+    return _mcp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -576,28 +596,29 @@ async def get_active_incidents_table(limit: int = 20):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/recent-failures-table")
-async def get_recent_failures_table(limit: int = 20, mcp=Depends(_get_mcp)):
+async def get_recent_failures_table(limit: int = 20):
     """
     Recent failed messages feed for table display.
-    
-    Returns the most recent failed messages with key details.
+
+    Reads from HANA incidents (no live CPI OData call) so it works
+    immediately at startup and shows error previews correctly.
     """
     try:
-        raw_errors = await mcp.error_fetcher.fetch_failed_messages(limit=limit)
-        
+        rows = get_all_incidents(limit=limit)
+
         recent_failures = [
             {
-                "message_guid": raw.get("MessageGuid"),
-                "iflow_name": raw.get("IntegrationFlowName"),
-                "status": raw.get("Status", "FAILED"),
-                "log_end": raw.get("LogEnd"),
-                "sender": raw.get("Sender"),
-                "receiver": raw.get("Receiver"),
-                "error_preview": (raw.get("CustomStatus", "") or "")[:100],
+                "message_guid":  inc.get("message_guid") or "-",
+                "iflow_name":    inc.get("iflow_id") or inc.get("iflow_name") or "-",
+                "status":        inc.get("status") or "DETECTED",
+                "log_end":       inc.get("last_seen") or inc.get("log_end") or inc.get("created_at"),
+                "sender":        inc.get("sender"),
+                "receiver":      inc.get("receiver"),
+                "error_preview": (inc.get("error_message") or "")[:120],
             }
-            for raw in raw_errors
+            for inc in rows
         ]
-        
+
         return {
             "recent_failures": recent_failures,
             "count": len(recent_failures),
