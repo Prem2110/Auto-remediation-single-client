@@ -407,6 +407,7 @@ RCA — Root Cause:  {root_cause}
 RCA — Fix Spec:    {proposed_fix}
 Affected Component:{affected_component}
 {pattern_history}
+{sap_notes}
 
 IMPORTANT — "RCA — Fix Spec" is derived from automated analysis. It is a STARTING POINT, not
 a literal instruction. You MUST verify every field name, XPath expression, and namespace prefix

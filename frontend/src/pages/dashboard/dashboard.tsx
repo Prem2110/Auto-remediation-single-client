@@ -281,10 +281,16 @@ export default function Dashboard() {
           <SectionTitle title="Top Failing iFlows" />
           {dashLoading ? <SkeletonChart /> : (
             <ResponsiveContainer width="100%" height={300}>
-              <BarChart data={iflowData} layout="vertical" margin={{ left: 20 }}>
+              <BarChart data={iflowData} layout="vertical" margin={{ left: 10, right: 10 }}>
                 <CartesianGrid strokeDasharray="3 3" />
-                <XAxis type="number" />
-                <YAxis type="category" dataKey="iflow_name" width={120} tick={{ fontSize: 11 }} />
+                <XAxis type="number" allowDecimals={false} />
+                <YAxis
+                  type="category"
+                  dataKey="iflow_name"
+                  width={175}
+                  tick={{ fontSize: 11 }}
+                  tickFormatter={(v: string) => v.length > 22 ? `${v.slice(0, 20)}…` : v}
+                />
                 <Tooltip />
                 <Bar dataKey="failure_count" name="Failures" fill="#4dabf7" />
               </BarChart>

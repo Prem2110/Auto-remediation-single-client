@@ -41,6 +41,7 @@ from core.constants import (
 from core.validators import _extract_iflow_file, _fix_ctx
 from db.database import get_similar_patterns
 from utils.utils import get_hana_timestamp
+from utils.vector_store import get_vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -456,6 +457,13 @@ Must do:
                 f"Use this as a reference — apply the same change if the root cause matches.\n"
             )
 
+        # SAP Notes from vector store — gives the fixer knowledge base context
+        _vs = get_vector_store()
+        _notes = _vs.retrieve_relevant_notes(error_message or "", error_type or "", iflow_id, limit=3)
+        sap_notes = _vs.format_notes_for_prompt(_notes) if _notes else ""
+        if sap_notes:
+            logger.info("[FIX_DEPLOY] Vector store returned %d SAP note(s) for iflow=%s", len(_notes), iflow_id)
+
         error_type_guidance = ERROR_TYPE_FIX_GUIDANCE.get(error_type or "", "")
         prompt = FIX_AND_DEPLOY_PROMPT_TEMPLATE.format(
             iflow_id=iflow_id,
@@ -466,6 +474,7 @@ Must do:
             proposed_fix=proposed_fix or f"Investigate and fix the error: {error_message}",
             affected_component=affected_component or "unknown",
             pattern_history=pattern_history,
+            sap_notes=sap_notes,
             error_type_guidance=error_type_guidance,
             groovy_rules=CPI_IFLOW_GROOVY_RULES,
             iflow_xml_patterns=CPI_IFLOW_XML_PATTERNS,

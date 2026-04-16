@@ -1204,10 +1204,10 @@ Rules:
         """
         Normalize a raw AEM / SAP CPI queue message to the standard incident dict.
 
-        The FailedLogscapturing_Schedule iFlow publishes SAP multimap XML, not JSON.
-        The XML body contains the error text and embeds the MPL ID (message GUID) as:
-            'The MPL ID for the failed message is : <GUID>'
-        We extract it so the OData fallback in _route_stage can resolve the iFlow name.
+        Handles three source formats (checked in _route_stage before this is called):
+          1. JSON multimap  – {"multimap:Messages": {"multimap:Message1": {"MessageProcessingLogs": [...]}}}
+          2. XML multimap   – raw_body contains <Error> blocks with embedded MPL IDs
+          3. Single message – flat JSON with top-level MessageGuid / IntegrationFlowName fields (this method)
         """
         raw_body   = msg.get("raw_body") or ""
 
@@ -1289,6 +1289,54 @@ Rules:
         stage = message.get("stage", "observed")
         try:
             if stage == "observed":
+                # ── JSON multimap format ───────────────────────────────────────
+                # {"multimap:Messages": {"multimap:Message1": {"MessageProcessingLogs": [...]}}}
+                mm_root = message.get("multimap:Messages")
+                if mm_root and isinstance(mm_root, dict):
+                    logs: list = []
+                    for msg_block in mm_root.values():
+                        if isinstance(msg_block, dict):
+                            logs.extend(msg_block.get("MessageProcessingLogs", []))
+                    if logs:
+                        logger.info("[Orchestrator] JSON multimap — splitting %d log entry(ies)", len(logs))
+                        for entry in logs:
+                            if str(entry.get("Status", "")).upper() != "FAILED":
+                                continue
+                            raw_err   = (entry.get("ErrorMessage") or "").strip()
+                            clean_err = re.sub(
+                                r"\nThe MPL ID for the failed message is\s*:\s*\S+\s*$", "", raw_err
+                            ).strip()
+                            inc = {
+                                "source_type":    "AEM_QUEUE",
+                                "message_guid":   entry.get("MessageGuid", ""),
+                                "iflow_id":       entry.get("IntegrationFlowName", ""),
+                                "artifact_id":    "",
+                                "sender":         "",
+                                "receiver":       "",
+                                "status":         "FAILED",
+                                "log_start":      "",
+                                "log_end":        entry.get("LogEnd", ""),
+                                "error_message":  clean_err,
+                                "correlation_id": "",
+                                "error_type":     "",
+                            }
+                            if inc["message_guid"] and self._observer:
+                                try:
+                                    meta = await self._observer.error_fetcher.fetch_message_metadata(inc["message_guid"])
+                                    if meta.get("Sender"):
+                                        inc["sender"]    = meta["Sender"]
+                                        inc["receiver"]  = meta.get("Receiver", "")
+                                        inc["log_start"] = meta.get("LogStart", "")
+                                    if not inc["log_end"]:
+                                        inc["log_end"] = meta.get("LogEnd", "")
+                                    logger.info("[Orchestrator] OData enriched iflow=%s guid=%s",
+                                                inc["iflow_id"], inc["message_guid"])
+                                except Exception as _e:
+                                    logger.warning("[Orchestrator] OData enrichment failed guid=%s: %s",
+                                                   inc["message_guid"], _e)
+                            await self.process_detected_error(inc)
+                        return  # all entries dispatched
+
                 # ── SAP multimap XML: one Solace message = N <Error> blocks ──
                 raw_body = message.get("raw_body", "")
                 if raw_body and raw_body.strip().startswith("<"):
@@ -1415,7 +1463,11 @@ Rules:
         _BATCH_SIZE          = 20    # max messages to drain per tick
         _IDLE_SLEEP          = 0.1   # seconds to sleep when queue is empty
         _TIMEOUT_CHECK_EVERY = 300   # run approval-timeout sweep every 5 minutes
+        _INFLIGHT_CAP        = 5     # max concurrent _route_stage tasks (back-pressure guard)
+        _BACKPRESSURE_SLEEP  = 0.5   # seconds to wait when inflight cap is reached
         _last_timeout_check  = 0.0
+        _active_tasks: set   = set()
+        _was_at_cap          = False  # track state change to log only on transition
 
         while self._autonomous_running:
             try:
@@ -1428,13 +1480,30 @@ Rules:
                     except Exception as exc:
                         logger.warning("[Orchestrator] Timeout check error: %s", exc)
 
-                # Drain up to _BATCH_SIZE messages per tick — no idle sleep when busy
+                # Prune completed tasks each tick
+                _active_tasks = {t for t in _active_tasks if not t.done()}
+                inflight = len(_active_tasks)
+
+                # Back-pressure: pause draining when inflight cap is reached
+                if inflight >= _INFLIGHT_CAP:
+                    if not _was_at_cap:
+                        logger.info("[Orchestrator] Back-pressure — %d tasks in flight, pausing drain", inflight)
+                        _was_at_cap = True
+                    await asyncio.sleep(_BACKPRESSURE_SLEEP)
+                    continue
+
+                if _was_at_cap:
+                    logger.info("[Orchestrator] Back-pressure cleared — resuming drain")
+                    _was_at_cap = False
+
+                # Drain up to _BATCH_SIZE messages per tick (while below inflight cap)
                 drained = 0
-                while drained < _BATCH_SIZE:
+                while drained < _BATCH_SIZE and len(_active_tasks) < _INFLIGHT_CAP:
                     msg = await self._fetch_from_aem_queue()
                     if msg is None:
                         break
-                    asyncio.create_task(self._route_stage(msg))
+                    task = asyncio.create_task(self._route_stage(msg))
+                    _active_tasks.add(task)
                     drained += 1
 
                 # Sleep only when the queue was empty; yield immediately if busy

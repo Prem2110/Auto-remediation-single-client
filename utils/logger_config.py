@@ -105,11 +105,15 @@ def configure_logging(level: int = logging.INFO):
         console_handler.setLevel(level)
         console_handler.setFormatter(logging.Formatter(LOG_FORMAT))
 
+    _uvicorn_console = logging.StreamHandler()
+    _uvicorn_console.setLevel(level)
+    _uvicorn_console.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
     for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         named_logger = logging.getLogger(logger_name)
         named_logger.handlers.clear()
+        named_logger.addHandler(_uvicorn_console)
         named_logger.setLevel(level)
-        named_logger.propagate = True
+        named_logger.propagate = False
 
     # Reduce auto-reload file watcher noise in logs.
     for logger_name in ("watchfiles", "watchfiles.main"):
