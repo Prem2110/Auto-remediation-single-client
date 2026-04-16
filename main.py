@@ -130,8 +130,13 @@ async def lifespan(app: FastAPI):
     ensure_fix_patterns_schema()
     ensure_escalation_tickets_schema()
 
-    # Create the MCP infrastructure
-    mcp = MultiMCP()
+    # Create the MCP infrastructure only if servers are configured
+    from core.constants import MCP_SERVERS
+    if MCP_SERVERS:
+        mcp = MultiMCP()
+    else:
+        mcp = None
+        logger.info("[Startup] MCP servers disabled - skipping MCP initialization")
 
     # Create all specialist agents (not yet wired)
     _rca      = RCAAgent(mcp)
@@ -152,10 +157,13 @@ async def lifespan(app: FastAPI):
 
     async def _init_background():
         try:
-            logger.info("[Startup] Initialising MCP servers in background…")
-            await mcp.connect()
-            await mcp.discover_tools()
-            await mcp.build_agent()                  # full-toolset shared agent (must be first)
+            if mcp:
+                logger.info("[Startup] Initialising MCP servers in background…")
+                await mcp.connect()
+                await mcp.discover_tools()
+                await mcp.build_agent()                  # full-toolset shared agent (must be first)
+            else:
+                logger.info("[Startup] MCP disabled - skipping MCP initialization")
 
             # Build all specialist agents in parallel — they are independent of each other
             await asyncio.gather(
@@ -240,8 +248,8 @@ app.include_router(_sm_dash)
 # ─────────────────────────────────────────────
 
 def _guard() -> None:
-    if mcp is None or orchestrator is None:
-        raise HTTPException(status_code=503, detail="Agents not ready — MCP still initialising.")
+    if orchestrator is None:
+        raise HTTPException(status_code=503, detail="Agents not ready — still initialising.")
 
 
 def _resolve_incident(incident_ref: str) -> Optional[Dict]:
@@ -1063,3 +1071,5 @@ if __name__ == "__main__":
         reload_excludes=["*.log", "*.db", "logs/*", "__pycache__"] if _dev else [],
         log_level="info",
     )
+
+# run this code using UV run

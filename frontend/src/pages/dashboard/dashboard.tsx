@@ -13,7 +13,6 @@ import {
   type PaginatedMessagesResponse,
   type PaginatedIncidentsResponse,
 } from "../../services/api.ts";
-import { usePagination } from "../../hooks/usePagination";
 import Pagination from "../../components/pagination/Pagination";
 import styles from "./dashboard.module.css";
 
@@ -122,39 +121,33 @@ function SkeletonRows({ count = 5 }: { count?: number }) {
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default function Dashboard() {
-  const qOpts = { refetchInterval: 60_000, retry: 3, retryDelay: 3_000 } as const;
-  
+  // Chart/KPI data auto-refreshes every 60s; paginated tables do not.
+  const chartOpts = { refetchInterval: 60_000, retry: 3, retryDelay: 3_000 } as const;
+  const tableOpts = { retry: 2, retryDelay: 2_000, placeholderData: (prev: unknown) => prev } as const;
+
   // ─ Fetch consolidated dashboard data (charts, KPIs, AEM stats) ────────────────
-  const { data: dashData, isLoading: dashLoading } = useQuery({ 
+  const { data: dashData, isLoading: dashLoading } = useQuery({
     queryKey: ["dash-all"],
     queryFn: fetchDashboardAll,
-    ...qOpts,
+    ...chartOpts,
   });
-  
-  // Get total counts from API to sync with pagination
-  const failuresTotalCount = ((dashData as any)?.total_messages_count ?? 0) as number;
-  const incidentsTotalCount = ((dashData as any)?.total_incidents_count ?? 0) as number;
-  
+
   // ─ Pagination for Recent Failed Messages ──────────────────────────────────────
-  const failuresPagination = usePagination(20, failuresTotalCount);
-  const { data: failuresData, isLoading: failuresLoading } = useQuery({
-    queryKey: ["dash-failures-paginated", failuresPagination.currentPage, failuresPagination.pageSize],
-    queryFn: () => fetchFailedMessagesPaginated(
-      failuresPagination.currentPage,
-      failuresPagination.pageSize,
-    ),
-    ...qOpts,
+  const [failuresPage, setFailuresPage] = useState(1);
+  const [failuresPageSize, setFailuresPageSize] = useState(20);
+  const { data: failuresData, isLoading: failuresLoading, isFetching: failuresFetching } = useQuery({
+    queryKey: ["dash-failures-paginated", failuresPage, failuresPageSize],
+    queryFn: () => fetchFailedMessagesPaginated(failuresPage, failuresPageSize),
+    ...tableOpts,
   });
 
   // ─ Pagination for Active Incidents ────────────────────────────────────────────
-  const incidentsPagination = usePagination(20, incidentsTotalCount);
-  const { data: incidentsData, isLoading: incidentsLoading } = useQuery({
-    queryKey: ["dash-incidents-paginated", incidentsPagination.currentPage, incidentsPagination.pageSize],
-    queryFn: () => fetchActiveIncidentsPaginated(
-      incidentsPagination.currentPage,
-      incidentsPagination.pageSize,
-    ),
-    ...qOpts,
+  const [incidentsPage, setIncidentsPage] = useState(1);
+  const [incidentsPageSize, setIncidentsPageSize] = useState(20);
+  const { data: incidentsData, isLoading: incidentsLoading, isFetching: incidentsFetching } = useQuery({
+    queryKey: ["dash-incidents-paginated", incidentsPage, incidentsPageSize],
+    queryFn: () => fetchActiveIncidentsPaginated(incidentsPage, incidentsPageSize),
+    ...tableOpts,
   });
 
   // Parse consolidated dashboard data
@@ -174,11 +167,19 @@ export default function Dashboard() {
   const aemStageData = Object.entries(aemStageRaw).map(([stage, count]) => ({ stage, count }));
 
   // Extract paginated table data
-  const recentFails = ((failuresData as PaginatedMessagesResponse | undefined)?.messages ?? []) as Record<string, unknown>[];
-  const apiFailuresTotalCount = (failuresData as PaginatedMessagesResponse | undefined)?.total_count ?? 0;
-  
-  const activeInc = ((incidentsData as PaginatedIncidentsResponse | undefined)?.incidents ?? []) as Record<string, unknown>[];
-  const apiIncidentsTotalCount = (incidentsData as PaginatedIncidentsResponse | undefined)?.total_count ?? 0;
+  const failuresResp = failuresData as PaginatedMessagesResponse | undefined;
+  const recentFails = (failuresResp?.messages ?? []) as Record<string, unknown>[];
+  const failuresTotalCount = failuresResp?.total_count ?? 0;
+  const failuresTotalPages = failuresResp?.total_pages ?? 1;
+  const failuresHasNext = failuresResp?.has_next ?? false;
+  const failuresHasPrev = failuresResp?.has_previous ?? false;
+
+  const incidentsResp = incidentsData as PaginatedIncidentsResponse | undefined;
+  const activeInc = (incidentsResp?.incidents ?? []) as Record<string, unknown>[];
+  const incidentsTotalCount = incidentsResp?.total_count ?? 0;
+  const incidentsTotalPages = incidentsResp?.total_pages ?? 1;
+  const incidentsHasNext = incidentsResp?.has_next ?? false;
+  const incidentsHasPrev = incidentsResp?.has_previous ?? false;
 
   return (
     <div className={styles.page}>
@@ -331,7 +332,7 @@ export default function Dashboard() {
       {/* ── Recent Failed Messages with Pagination ── */}
       <div className={styles.tableBlock}>
         <SectionTitle title="Recent Failed Messages" />
-        <div className={styles.tableWrapper}>
+        <div className={styles.tableWrapper} style={failuresFetching && !failuresLoading ? { opacity: 0.6, pointerEvents: "none" } : undefined}>
           <table className={styles.table}>
             <thead>
               <tr>
@@ -363,15 +364,15 @@ export default function Dashboard() {
         </div>
         {!failuresLoading && recentFails.length > 0 && (
           <Pagination
-            currentPage={failuresPagination.currentPage}
-            totalPages={failuresPagination.totalPages}
-            pageSize={failuresPagination.pageSize}
-            totalCount={apiFailuresTotalCount}
-            hasNextPage={failuresPagination.hasNextPage}
-            hasPreviousPage={failuresPagination.hasPreviousPage}
-            onPreviousClick={failuresPagination.previousPage}
-            onNextClick={failuresPagination.nextPage}
-            onPageSizeChange={failuresPagination.setPageSize}
+            currentPage={failuresPage}
+            totalPages={failuresTotalPages}
+            pageSize={failuresPageSize}
+            totalCount={failuresTotalCount}
+            hasNextPage={failuresHasNext}
+            hasPreviousPage={failuresHasPrev}
+            onPreviousClick={() => setFailuresPage((p) => Math.max(1, p - 1))}
+            onNextClick={() => setFailuresPage((p) => p + 1)}
+            onPageSizeChange={(s) => { setFailuresPageSize(s); setFailuresPage(1); }}
           />
         )}
       </div>
@@ -379,7 +380,7 @@ export default function Dashboard() {
       {/* ── Active Incidents with Pagination ── */}
       <div className={styles.tableBlock}>
         <SectionTitle title="Active Incidents" />
-        <div className={styles.tableWrapper}>
+        <div className={styles.tableWrapper} style={incidentsFetching && !incidentsLoading ? { opacity: 0.6, pointerEvents: "none" } : undefined}>
           <table className={styles.table}>
             <thead>
               <tr>
@@ -422,15 +423,15 @@ export default function Dashboard() {
         </div>
         {!incidentsLoading && activeInc.length > 0 && (
           <Pagination
-            currentPage={incidentsPagination.currentPage}
-            totalPages={incidentsPagination.totalPages}
-            pageSize={incidentsPagination.pageSize}
-            totalCount={apiIncidentsTotalCount}
-            hasNextPage={incidentsPagination.hasNextPage}
-            hasPreviousPage={incidentsPagination.hasPreviousPage}
-            onPreviousClick={incidentsPagination.previousPage}
-            onNextClick={incidentsPagination.nextPage}
-            onPageSizeChange={incidentsPagination.setPageSize}
+            currentPage={incidentsPage}
+            totalPages={incidentsTotalPages}
+            pageSize={incidentsPageSize}
+            totalCount={incidentsTotalCount}
+            hasNextPage={incidentsHasNext}
+            hasPreviousPage={incidentsHasPrev}
+            onPreviousClick={() => setIncidentsPage((p) => Math.max(1, p - 1))}
+            onNextClick={() => setIncidentsPage((p) => p + 1)}
+            onPageSizeChange={(s) => { setIncidentsPageSize(s); setIncidentsPage(1); }}
           />
         )}
       </div>

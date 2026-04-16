@@ -967,7 +967,7 @@ async def list_messages_paginated(
     if page_size < 1 or page_size > 500:
         raise HTTPException(status_code=400, detail="Page size must be between 1 and 500")
 
-    incidents = get_all_incidents(limit=page_size * page * 3)
+    incidents = get_all_incidents(limit=0)
 
     filtered_messages: List[Dict] = []
     for inc in incidents:

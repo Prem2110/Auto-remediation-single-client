@@ -32,17 +32,36 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from collections import defaultdict
 import logging
+import asyncio
+import os
 
 from db.database import (
     get_all_incidents,
     get_incident_by_id,
     get_incident_by_message_guid,
+    count_all_incidents,
 )
 from utils.utils import get_hana_timestamp
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ASYNC WRAPPERS FOR BLOCKING DATABASE CALLS
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _aget_all_incidents(limit: int = 50, status: Optional[str] = None):
+    """Async wrapper for get_all_incidents to avoid blocking the event loop."""
+    return await asyncio.to_thread(get_all_incidents, status, limit)
+
+async def _acount_all_incidents(status: Optional[str] = None):
+    """Async wrapper for count_all_incidents to avoid blocking the event loop."""
+    return await asyncio.to_thread(count_all_incidents, status)
+
+async def _aget_incident_by_id(incident_id: str):
+    """Async wrapper for get_incident_by_id."""
+    return await asyncio.to_thread(get_incident_by_id, incident_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,6 +103,12 @@ def _get_mcp():
 # The frontend uses this instead of firing 7 separate requests.
 # ─────────────────────────────────────────────────────────────────────────────
 
+@router.get("/test")
+async def get_test():
+    """Simple test endpoint."""
+    return {"status": "ok"}
+
+
 @router.get("/all")
 async def get_dashboard_all(mcp=Depends(_get_mcp)):
     """
@@ -91,131 +116,120 @@ async def get_dashboard_all(mcp=Depends(_get_mcp)):
     Replaces 7 individual endpoints with one HANA roundtrip.
     """
     try:
-        # ── One DB call for all aggregate endpoints ────────────────────────
-        all_incidents = get_all_incidents(limit=1000)
-        total = len(all_incidents)
+        all_incidents = await _aget_all_incidents(limit=2000)
+        total_incidents = len(all_incidents)
 
-        # ── KPI counts ────────────────────────────────────────────────────
-        in_progress = fix_failed = auto_fixed = pending_approval = rca_complete = 0
-        error_types: Dict[str, int] = defaultdict(int)
-        status_counts: Dict[str, int] = defaultdict(int)
-        iflow_failures: Dict[str, int] = defaultdict(int)
-        timeline_buckets: Dict[str, int] = defaultdict(int)
+        in_progress = sum(
+            1 for i in all_incidents
+            if i.get("status") in {"FIX_IN_PROGRESS", "RCA_IN_PROGRESS", "FIX_DEPLOYED"}
+        )
+        fix_failed = sum(
+            1 for i in all_incidents
+            if i.get("status") in {
+                "FIX_FAILED", "FIX_FAILED_UPDATE", "FIX_FAILED_DEPLOY",
+                "FIX_FAILED_RUNTIME", "TICKET_CREATED",
+            }
+        )
+        auto_fixed = sum(
+            1 for i in all_incidents
+            if i.get("status") in {"FIX_VERIFIED", "HUMAN_INITIATED_FIX", "RETRIED"}
+        )
+        pending_approval = sum(
+            1 for i in all_incidents
+            if i.get("status") in {"AWAITING_APPROVAL", "AWAITING_HUMAN_REVIEW"}
+        )
+
         resolution_times = []
+        for inc in all_incidents:
+            if inc.get("resolved_at") and inc.get("created_at"):
+                created = _parse_sap_timestamp(str(inc.get("created_at")))
+                resolved = _parse_sap_timestamp(str(inc.get("resolved_at")))
+                if created and resolved:
+                    resolution_times.append((resolved - created).total_seconds() / 60)
 
-        active_statuses = {
-            "DETECTED", "RCA_IN_PROGRESS", "RCA_COMPLETE",
-            "AWAITING_APPROVAL", "AWAITING_HUMAN_REVIEW",
-            "FIX_IN_PROGRESS", "FIX_DEPLOYED",
-        }
-        active_incidents_list: list = []
-        recent_failures_list: list = []
+        rca_complete = sum(
+            1 for i in all_incidents
+            if i.get("root_cause") and i.get("proposed_fix")
+        )
+
+        auto_fix_rate = round(auto_fixed / total_incidents * 100, 1) if total_incidents > 0 else 0.0
+        avg_resolution_time = round(sum(resolution_times) / len(resolution_times), 1) if resolution_times else 0.0
+        rca_coverage = round(rca_complete / total_incidents * 100, 1) if total_incidents > 0 else 0.0
+
+        status_counts: Dict[str, int] = defaultdict(int)
+        error_counts: Dict[str, int] = defaultdict(int)
+        iflow_counts: Dict[str, int] = defaultdict(int)
+        timeline_buckets: Dict[str, int] = defaultdict(int)
+        cutoff = datetime.utcnow() - timedelta(hours=24)
 
         for inc in all_incidents:
-            status = (inc.get("status") or "UNKNOWN").upper()
+            status = str(inc.get("status") or "UNKNOWN")
+            error_type = str(inc.get("error_type") or "UNKNOWN")
+            iflow_name = str(inc.get("iflow_id") or inc.get("iflow_name") or "Unknown")
+
             status_counts[status] += 1
+            error_counts[error_type] += 1
+            iflow_counts[iflow_name] += 1
 
-            if status in {"FIX_IN_PROGRESS", "RCA_IN_PROGRESS", "FIX_DEPLOYED"}:
-                in_progress += 1
-            if status in {"FIX_FAILED", "FIX_FAILED_UPDATE", "FIX_FAILED_DEPLOY",
-                          "FIX_FAILED_RUNTIME", "TICKET_CREATED"}:
-                fix_failed += 1
-            if status in {"FIX_VERIFIED", "HUMAN_INITIATED_FIX", "RETRIED"}:
-                auto_fixed += 1
-            if status in {"AWAITING_APPROVAL", "AWAITING_HUMAN_REVIEW"}:
-                pending_approval += 1
-            if inc.get("root_cause") and inc.get("proposed_fix"):
-                rca_complete += 1
+            ts = _parse_sap_timestamp(
+                str(inc.get("last_seen") or inc.get("log_end") or inc.get("created_at") or "")
+            )
+            if ts and ts >= cutoff:
+                timeline_buckets[_time_bucket(ts, "hour")] += 1
 
-            et = inc.get("error_type") or "UNKNOWN"
-            error_types[et] += 1
-
-            iflow = inc.get("iflow_id") or ""
-            if iflow:
-                iflow_failures[iflow] += 1
-
-            created_raw = inc.get("created_at") or ""
-            created_dt = _parse_sap_timestamp(str(created_raw))
-            if created_dt:
-                timeline_buckets[_time_bucket(created_dt, "hour")] += 1
-
-            if inc.get("resolved_at") and inc.get("created_at"):
-                c = _parse_sap_timestamp(str(inc.get("created_at")))
-                r = _parse_sap_timestamp(str(inc.get("resolved_at")))
-                if c and r:
-                    resolution_times.append((r - c).total_seconds() / 60)
-
-            if status in active_statuses and len(active_incidents_list) < 20:
-                active_incidents_list.append({
-                    "incident_id":     inc.get("incident_id"),
-                    "message_guid":    inc.get("message_guid"),
-                    "iflow_id":        inc.get("iflow_id"),
-                    "error_type":      inc.get("error_type"),
-                    "status":          inc.get("status"),
-                    "created_at":      inc.get("created_at"),
-                    "last_seen":       inc.get("last_seen"),
-                    "occurrence_count": inc.get("occurrence_count", 1),
-                    "rca_confidence":  inc.get("rca_confidence"),
-                })
-
-            if len(recent_failures_list) < 20:
-                recent_failures_list.append({
-                    "message_guid":  inc.get("message_guid") or "-",
-                    "iflow_name":    inc.get("iflow_id") or inc.get("iflow_name") or "-",
-                    "status":        inc.get("status") or "DETECTED",
-                    "log_end":       inc.get("last_seen") or inc.get("log_end") or inc.get("created_at"),
-                    "error_preview": (inc.get("error_message") or "")[:120],
-                })
-
-        # ── SAP CPI live count (separate network call, run concurrently) ──
+        total_failed_messages = total_incidents
         try:
-            total_failed_messages = await mcp.error_fetcher.fetch_failed_messages_count()
-        except Exception:
-            total_failed_messages = 0
+            total_failed_messages = int(await mcp.error_fetcher.fetch_failed_messages_count())
+        except Exception as exc:
+            logger.warning(f"[Dashboard] Failed to fetch live failed message count: {exc}")
 
-        auto_fix_rate = round(auto_fixed / total * 100, 1) if total > 0 else 0.0
-        avg_resolution = round(sum(resolution_times) / len(resolution_times), 1) if resolution_times else 0.0
-        rca_coverage = round(rca_complete / total * 100, 1) if total > 0 else 0.0
-
-        now = _parse_sap_timestamp(get_hana_timestamp()) or datetime.utcnow()
-        cutoff_24h = now - timedelta(hours=24)
+        aem_enabled = os.getenv("AEM_ENABLED", "false").lower() == "true"
+        aem_payload: Dict[str, Any]
+        if aem_enabled:
+            aem_payload = {
+                "queues": {},
+                "stage_counts": {},
+                "semp_error": None,
+            }
+        else:
+            aem_payload = {"warning": "AEM is disabled in backend configuration."}
 
         return {
-            "timestamp": get_hana_timestamp(),
             "kpi": {
-                "total_failed_messages":    total_failed_messages,
-                "total_incidents":          total,
-                "in_progress":              in_progress,
-                "fix_failed":               fix_failed,
-                "auto_fixed":               auto_fixed,
-                "pending_approval":         pending_approval,
-                "auto_fix_rate":            auto_fix_rate,
-                "avg_resolution_time_minutes": avg_resolution,
-                "rca_coverage_percent":     rca_coverage,
+                "total_failed_messages": total_failed_messages,
+                "total_incidents": total_incidents,
+                "in_progress": in_progress,
+                "fix_failed": fix_failed,
+                "auto_fixed": auto_fixed,
+                "pending_approval": pending_approval,
+                "auto_fix_rate": auto_fix_rate,
+                "avg_resolution_time_minutes": avg_resolution_time,
+                "rca_coverage_percent": rca_coverage,
             },
             "status_breakdown": [
-                {"status": s, "count": c}
-                for s, c in sorted(status_counts.items(), key=lambda x: x[1], reverse=True)
+                {"status": status, "count": count}
+                for status, count in sorted(status_counts.items(), key=lambda x: x[1], reverse=True)
             ],
             "error_distribution": [
-                {"error_type": et, "count": c,
-                 "percentage": round(c / total * 100, 1) if total else 0.0}
-                for et, c in sorted(error_types.items(), key=lambda x: x[1], reverse=True)
+                {"error_type": error_type, "count": count}
+                for error_type, count in sorted(error_counts.items(), key=lambda x: x[1], reverse=True)
             ],
             "top_iflows": [
-                {"iflow_name": iflow, "failure_count": cnt}
-                for iflow, cnt in sorted(iflow_failures.items(), key=lambda x: x[1], reverse=True)[:10]
+                {"iflow_name": iflow_name, "failure_count": count}
+                for iflow_name, count in sorted(iflow_counts.items(), key=lambda x: x[1], reverse=True)[:10]
             ],
             "timeline": [
-                {"time": bucket, "count": cnt}
-                for bucket, cnt in sorted(timeline_buckets.items())
+                {"time": bucket, "count": count}
+                for bucket, count in sorted(timeline_buckets.items())
             ],
-            "active_incidents": active_incidents_list,
-            "recent_failures":  recent_failures_list,
+            "aem": aem_payload,
+            "total_messages_count": total_failed_messages,
+            "total_incidents_count": total_incidents,
+            "timestamp": get_hana_timestamp(),
         }
     except Exception as exc:
-        logger.error(f"[Dashboard] /all error: {exc}")
-        raise HTTPException(status_code=500, detail=str(exc))
+        logger.error(f"[Dashboard] /all aggregation error: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to load dashboard data")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -353,7 +367,7 @@ async def get_error_distribution():
     """
     try:
         all_incidents = get_all_incidents(limit=1000)
-        total = len(all_incidents)
+        total = count_all_incidents()
         
         error_types: Dict[str, int] = defaultdict(int)
         for inc in all_incidents:
@@ -393,7 +407,7 @@ async def get_status_distribution():
     """
     try:
         all_incidents = get_all_incidents(limit=1000)
-        total = len(all_incidents)
+        total = count_all_incidents()
         
         statuses: Dict[str, int] = defaultdict(int)
         for inc in all_incidents:
@@ -438,7 +452,7 @@ async def get_status_breakdown():
     """
     try:
         all_incidents = get_all_incidents(limit=1000)
-        total = len(all_incidents)
+        total = count_all_incidents()
         
         # Define all possible statuses with descriptions
         status_definitions = {
@@ -751,7 +765,7 @@ async def get_incidents_paginated(
             "AWAITING_APPROVAL", "AWAITING_HUMAN_REVIEW", "FIX_IN_PROGRESS", "FIX_DEPLOYED",
         }
         
-        all_incidents = get_all_incidents(limit=page_size * page * 3)
+        all_incidents = get_all_incidents(limit=0)
         
         filtered_incidents = [
             {
@@ -1256,7 +1270,7 @@ async def get_rca_coverage():
     """
     try:
         all_incidents = get_all_incidents(limit=1000)
-        total = len(all_incidents)
+        total = count_all_incidents()
         
         rca_complete = sum(
             1 for inc in all_incidents
