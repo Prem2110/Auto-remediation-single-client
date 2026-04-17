@@ -509,10 +509,18 @@ def _tab_ai_recommendation(incident: Dict) -> Dict:
     field_changes  = _extract_field_changes(error_message, proposed_fix)
     conf_label     = "High" if confidence >= 0.90 else ("Medium" if confidence >= 0.70 else "Low")
 
-    can_fix = incident.get("status") in {
-        "RCA_COMPLETE", "AWAITING_APPROVAL", "DETECTED", "RCA_FAILED",
-        "FIX_FAILED", "FIX_FAILED_UPDATE", "FIX_FAILED_DEPLOY", "FIX_FAILED_RUNTIME",
+    # Show "Generate Fix" whenever RCA data exists and the fix isn't already
+    # running, successfully completed, or escalated to a ticket/approval queue.
+    _NO_FIX_STATUSES = {
+        "AUTO_FIXED", "HUMAN_FIXED", "FIX_VERIFIED", "RETRIED", "SUCCESS",
+        "FIX_IN_PROGRESS", "RCA_IN_PROGRESS", "FIX_APPLIED_PENDING_VERIFICATION",
+        "TICKET_CREATED", "PENDING_APPROVAL", "AWAITING_APPROVAL",
     }
+    status = incident.get("status", "")
+    can_fix = bool(
+        (root_cause or proposed_fix)
+        and status not in _NO_FIX_STATUSES
+    )
 
     return {
         "diagnosis":           root_cause,
@@ -1394,6 +1402,18 @@ async def apply_fix(
         raise HTTPException(
             status_code=400,
             detail="No actionable fix available. Call /analyze first."
+        )
+
+    # Guard: reject concurrent fix attempts on the same incident
+    _IN_PROGRESS_STATUSES = {"FIX_IN_PROGRESS", "RCA_IN_PROGRESS", "FIX_APPLIED_PENDING_VERIFICATION"}
+    if incident.get("status") in _IN_PROGRESS_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A fix is already in progress for incident {incident_id} "
+                f"(status: {incident.get('status')}). "
+                f"Poll GET /smart-monitoring/incidents/{incident_id}/fix_status for live progress."
+            )
         )
 
     if sync:

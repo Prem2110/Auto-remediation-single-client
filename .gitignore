@@ -28,3 +28,10 @@ build/
 uv.lock
 .python-version
 
+frontend/node_modules/
+.claude/settings.json
+
+# Solace vendored SDK
+solace/
+solace_pubsubplus-*.dist-info/
+manifest.yml

@@ -11,6 +11,7 @@ dependencies = [
     "beautifulsoup4>=4.14.3",
     "boto3>=1.42.44",
     "cachetools>=7.0.0",
+    "duckduckgo-search>=7.0.0",
     "fastapi>=0.128.5",
     "fastmcp>=2.14.5",
     "hdbcli>=2.27.23",
