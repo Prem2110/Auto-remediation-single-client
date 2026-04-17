@@ -28,6 +28,8 @@ from utils.vector_store import get_vector_store
 
 logger = logging.getLogger(__name__)
 
+_WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "false").lower() == "true"
+
 
 class RCAAgent:
     """
@@ -63,6 +65,34 @@ class RCAAgent:
             patterns = get_similar_patterns(fragment)
             return str(patterns)
 
+        @_tool
+        async def web_search_sap_error(query: str) -> str:
+            """
+            Search the web for SAP CPI solutions. Always prefix the query with the error
+            type or component name for best results (e.g. 'HttpResponseException No consumers
+            available SAP CPI iFlow').
+            """
+            try:
+                from duckduckgo_search import DDGS  # noqa: PLC0415
+                loop = asyncio.get_running_loop()
+                def _search():
+                    with DDGS() as ddgs:
+                        return list(ddgs.text(f"SAP CPI {query}", max_results=5))
+                results = await loop.run_in_executor(None, _search)
+                if not results:
+                    return "No web results found."
+                lines = []
+                for r in results:
+                    lines.append(f"Title: {r.get('title', '')}")
+                    lines.append(f"URL:   {r.get('href', '')}")
+                    lines.append(f"Body:  {r.get('body', '')[:400]}")
+                    lines.append("---")
+                logger.info("[RCA] Web search returned %d result(s) for query: %s", len(results), query)
+                return "\n".join(lines)
+            except Exception as exc:
+                logger.warning("[RCA] Web search failed: %s", exc)
+                return f"Web search unavailable: {exc}"
+
         # Targeted read-only MCP tools — no write/update/deploy
         rca_mcp_names = {
             "get-iflow", "get_message_logs", "get-message-logs",
@@ -76,16 +106,29 @@ class RCAAgent:
         if not rca_mcp_tools:
             rca_mcp_tools = [t for t in _mcp.tools if t.server == "integration_suite"]
 
-        all_tools = [get_vector_store_notes, get_cross_iflow_patterns] + rca_mcp_tools
+        local_tools = [get_vector_store_notes, get_cross_iflow_patterns]
+        if _WEB_SEARCH_ENABLED:
+            local_tools.append(web_search_sap_error)
+        all_tools = local_tools + rca_mcp_tools
 
-        system_prompt = """You are an SAP CPI Root Cause Analysis agent.
+        _web_search_line = (
+            "- web_search_sap_error      — search the web for SAP CPI solutions (use if SAP Notes are insufficient)\n"
+            if _WEB_SEARCH_ENABLED else ""
+        )
+        _web_search_rule = (
+            "- Call web_search_sap_error if SAP Notes and patterns do not provide a clear fix.\n"
+            if _WEB_SEARCH_ENABLED else ""
+        )
+        _max_calls = "8" if _WEB_SEARCH_ENABLED else "6"
+
+        system_prompt = f"""You are an SAP CPI Root Cause Analysis agent.
 
 Your ONLY job is to investigate a failed CPI message and produce a structured diagnosis.
 
 Available local tools:
 - get_vector_store_notes    — search SAP Notes for relevant guidance
 - get_cross_iflow_patterns  — find fixes that worked for same error on other iFlows
-
+{_web_search_line}
 Available MCP tools (read-only):
 - get-iflow         — read current iFlow configuration
 - get_message_logs  — read message processing log (use only if message GUID provided)
@@ -93,12 +136,12 @@ Available MCP tools (read-only):
 Rules:
 - Call get_vector_store_notes FIRST for SAP Notes guidance.
 - Call get_cross_iflow_patterns to check for proven fixes from other iFlows.
-- Call get-iflow ONCE to read the current iFlow configuration.
+{_web_search_rule}- Call get-iflow ONCE to read the current iFlow configuration.
 - Call get_message_logs at MOST ONCE if a message GUID is provided.
 - Do NOT call update-iflow, deploy-iflow, or any write/modify tool.
 - Do NOT ask for human input.
 - Return ONLY valid JSON after your investigation — no markdown, no preamble.
-- Maximum 6 tool calls total.
+- Maximum {_max_calls} tool calls total.
 
 Return exactly:
 {
@@ -116,8 +159,8 @@ Return exactly:
             deployment_id=os.getenv("LLM_DEPLOYMENT_ID_RCA") or None,
         )
         logger.info(
-            "[RCA] Agent ready — %d local tools + %d MCP tools.",
-            2, len(rca_mcp_tools),
+            "[RCA] Agent ready — %d local tools + %d MCP tools (web_search=%s).",
+            len(local_tools), len(rca_mcp_tools), _WEB_SEARCH_ENABLED,
         )
 
     # ── main entry point ─────────────────────────────────────────────────────

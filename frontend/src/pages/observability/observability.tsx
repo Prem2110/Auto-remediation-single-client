@@ -8,7 +8,6 @@ import {
   generateFixPatch,
   applyMessageFix,
   fetchFixStatus,
-  smartMonitoringChat,
   fetchPipelineStatus,
   fetchQueueStats,
 } from "../../services/api.ts";
@@ -132,6 +131,9 @@ const CARD_TIPS: Record<string, string> = {
   RETRY:       "Messages pending approval, ticket created or scheduled for retry",
 };
 
+// Explicit ordered keys for the 4 summary cards — never rely on STATUS_CONFIG insertion order
+const SUMMARY_CARD_KEYS = ["FAILED", "SUCCESS", "PROCESSING", "RETRY"] as const;
+
 /* ── Field-change highlight component ────────────────────────────────── */
 function FieldChangeHighlight({ changes }: { changes: IFieldChange[] }) {
   if (!changes?.length) return null;
@@ -190,8 +192,8 @@ function FixPlanSteps({ steps }: { steps: IFixPlanStep[] }) {
 /* ── Timeline component for History tab ──────────────────────────────── */
 function Timeline({ entries }: { entries: IHistoryTimelineEntry[] }) {
   const statusIcon: Record<string, string> = {
-    completed: "check_circle", failed: "error", pending: "schedule",
-    in_progress: "sync", info: "info",
+    completed: "✓", failed: "✕", pending: "○",
+    in_progress: "↻", info: "i",
   };
   const statusColor: Record<string, string> = {
     completed: "#16a34a", failed: "#dc2626", pending: "#d97706",
@@ -202,7 +204,7 @@ function Timeline({ entries }: { entries: IHistoryTimelineEntry[] }) {
       {entries.map((e, i) => (
         <div key={i} className={styles.timelineEntry}>
           <div className={styles.timelineDot} style={{ background: statusColor[e.status] || "#6b7280" }}>
-            {(statusIcon[e.status] || "circle")[0].toUpperCase()}
+            {statusIcon[e.status] ?? "·"}
           </div>
           <div className={styles.timelineContent}>
             <div className={styles.timelineStep}>{e.step}</div>
@@ -323,13 +325,13 @@ export default function Observability() {
   const [fixPatchLoading, setFixPatchLoading] = useState(false);
   const [fixState, setFixState] = useState<"idle" | "loading" | "success" | "error">("idle");
   const [fixResult, setFixResult] = useState<string>("");
+  const [fixProgress, setFixProgress] = useState<{
+    currentStep: string; stepIndex: number; totalSteps: number; stepsDone: string[];
+  } | null>(null);
   const [analyzeLoading, setAnalyzeLoading] = useState(false);
 
-  // Chat state
-  const [chatInput, setChatInput] = useState("");
-  const [chatMessages, setChatMessages] = useState<{ role: "user" | "ai"; text: string }[]>([]);
-  const [chatLoading, setChatLoading] = useState(false);
-  const [chatSessionId, setChatSessionId] = useState<string | null>(null);
+  // Approval action feedback
+  const [approvalActionError, setApprovalActionError] = useState<string | null>(null);
 
   const { data, isLoading, refetch, isFetching } = useQuery({
     queryKey: ["monitor-messages"],
@@ -417,7 +419,7 @@ export default function Observability() {
     all.forEach((m) => {
       const s = (m.status || "").toUpperCase();
       if (["FAILED", "FIX_FAILED", "RCA_FAILED", "PIPELINE_ERROR", "DETECTED"].includes(s)) result.FAILED++;
-      else if (["AUTO_FIXED", "HUMAN_FIXED", "FIX_VERIFIED", "RETRIED"].includes(s)) result.SUCCESS++;
+      else if (["AUTO_FIXED", "HUMAN_FIXED", "FIX_VERIFIED", "RETRIED", "SUCCESS"].includes(s)) result.SUCCESS++;
       else if (["RCA_IN_PROGRESS", "FIX_IN_PROGRESS", "CLASSIFIED", "RCA_COMPLETE", "FIX_APPLIED_PENDING_VERIFICATION"].includes(s)) result.PROCESSING++;
       else if (["RETRY", "PENDING_APPROVAL", "TICKET_CREATED", "AWAITING_APPROVAL"].includes(s)) result.RETRY++;
     });
@@ -429,6 +431,7 @@ export default function Observability() {
 
   /* ── Approval actions ──────────────────────────────────────────────── */
   const handleApprove = useCallback(async (incidentId: string) => {
+    setApprovalActionError(null);
     try {
       const response = await fetch(`/api/autonomous/incidents/${incidentId}/approve`, {
         method: "POST",
@@ -437,13 +440,16 @@ export default function Observability() {
       });
       if (response.ok) {
         refetchApprovals();
+      } else {
+        setApprovalActionError(`Approval failed — server returned ${response.status}. Please try again.`);
       }
-    } catch (error) {
-      console.error("Error approving fix:", error);
+    } catch {
+      setApprovalActionError("Approval failed — network error. Please check your connection.");
     }
   }, [refetchApprovals]);
 
   const handleReject = useCallback(async (incidentId: string) => {
+    setApprovalActionError(null);
     try {
       const response = await fetch(`/api/autonomous/incidents/${incidentId}/approve`, {
         method: "POST",
@@ -452,9 +458,11 @@ export default function Observability() {
       });
       if (response.ok) {
         refetchApprovals();
+      } else {
+        setApprovalActionError(`Rejection failed — server returned ${response.status}. Please try again.`);
       }
-    } catch (error) {
-      console.error("Error rejecting fix:", error);
+    } catch {
+      setApprovalActionError("Rejection failed — network error. Please check your connection.");
     }
   }, [refetchApprovals]);
 
@@ -467,9 +475,8 @@ export default function Observability() {
     setFixPatch(null);
     setFixState("idle");
     setFixResult("");
+    setFixProgress(null);
     setActiveTab("error");
-    setChatMessages([]);
-    setChatSessionId(null);
     setErrorExplain(null);
     setErrorExplainLoading(false);
     setErrorExplainErr(null);
@@ -532,13 +539,54 @@ export default function Observability() {
     }
   }, [selectedGuid]);
 
-  /* ── Apply fix (with status polling) ───────────────────────────────── */
+  /* ── Live fix polling (shared by handleApplyFix and auto-resume) ──── */
   const pollAbortRef = useRef<{ cancelled: boolean }>({ cancelled: false });
 
+  const startFixPolling = useCallback(async (incidentId: string) => {
+    let resolved = false;
+    for (let i = 0; i < 60; i++) {
+      if (pollAbortRef.current.cancelled) break;
+      await new Promise((r) => setTimeout(r, 5000));
+      try {
+        const s = await fetchFixStatus(incidentId) as Record<string, unknown>;
+        const st = (s.status as string || "").toUpperCase();
+
+        // Update the live step progress from the backend
+        setFixProgress({
+          currentStep: (s.current_step as string) || st,
+          stepIndex:   (s.step_index as number)  || 1,
+          totalSteps:  (s.total_steps as number) || 4,
+          stepsDone:   (s.steps_done as string[]) || [],
+        });
+
+        if (TERMINAL_STATUSES.has(st)) {
+          resolved = true;
+          setFixProgress(null);
+          if (["AUTO_FIXED", "HUMAN_FIXED", "FIX_VERIFIED", "RETRIED"].includes(st)) {
+            setFixState("success");
+            setFixResult((s.fix_summary as string) || "Fix applied and deployed.");
+          } else {
+            setFixState("error");
+            setFixResult((s.fix_summary as string) || `Fix failed (${st}).`);
+          }
+          break;
+        }
+      } catch {
+        // keep polling — transient network errors
+      }
+    }
+    if (!resolved && !pollAbortRef.current.cancelled) {
+      setFixProgress(null);
+      setFixResult("Still in progress. Refresh later for final status.");
+    }
+  }, []);
+
+  /* ── Apply fix ──────────────────────────────────────────────────────── */
   const handleApplyFix = useCallback(async () => {
     if (!selectedGuid) return;
     setFixState("loading");
-    setFixResult("Applying fix… get-iflow → update-iflow → deploy-iflow");
+    setFixResult("");
+    setFixProgress({ currentStep: "Submitting fix request…", stepIndex: 0, totalSteps: 4, stepsDone: [] });
     pollAbortRef.current.cancelled = false;
     try {
       const proposedFix =
@@ -553,37 +601,17 @@ export default function Observability() {
       const syncDeploy = result.deploy_success === true;
 
       if (syncStatus === "AUTO_FIXED" || syncStatus === "HUMAN_FIXED" || (syncFixApplied && syncDeploy)) {
+        setFixProgress(null);
         setFixState("success");
         setFixResult((result.summary as string) || "Fix applied and deployed successfully.");
       } else if (syncStatus === "FIX_FAILED") {
+        setFixProgress(null);
         setFixState("error");
         setFixResult((result.summary as string) || "Fix failed.");
       } else if (incidentId) {
-        for (let i = 0; i < 60; i++) {
-          if (pollAbortRef.current.cancelled) break;
-          await new Promise((r) => setTimeout(r, 5000));
-          try {
-            const s = await fetchFixStatus(incidentId) as Record<string, unknown>;
-            const st = (s.status as string || "").toUpperCase();
-            setFixResult(`Status: ${st}…`);
-            if (TERMINAL_STATUSES.has(st)) {
-              if (["AUTO_FIXED", "HUMAN_FIXED", "FIX_VERIFIED", "RETRIED"].includes(st)) {
-                setFixState("success");
-                setFixResult((s.fix_summary as string) || "Fix applied and deployed.");
-              } else {
-                setFixState("error");
-                setFixResult((s.fix_summary as string) || `Fix failed (${st}).`);
-              }
-              break;
-            }
-          } catch {
-            // keep polling
-          }
-        }
-        if (fixState === "loading") {
-          setFixResult("Still in progress. Refresh later for final status.");
-        }
+        await startFixPolling(incidentId);
       } else {
+        setFixProgress(null);
         setFixState("success");
         setFixResult((result.message as string) || "Fix queued. Refresh later for status.");
       }
@@ -593,32 +621,62 @@ export default function Observability() {
         setDetail(d);
       } catch { /* ignore */ }
     } catch (e) {
-      setFixState("error");
-      setFixResult(e instanceof Error ? e.message : "Fix failed");
+      const errMsg = e instanceof Error ? e.message : "Fix failed";
+      // 409 = another session already triggered the fix — connect to live progress
+      if (errMsg.includes("409") || errMsg.toLowerCase().includes("already in progress")) {
+        const incidentId = detail?.incident_id || "";
+        if (incidentId) {
+          setFixResult("");
+          setFixProgress({ currentStep: "Fix already in progress — connecting…", stepIndex: 0, totalSteps: 4, stepsDone: [] });
+          await startFixPolling(incidentId);
+        } else {
+          setFixState("error");
+          setFixProgress(null);
+          setFixResult("Fix already in progress by another user. Reload this message to see status.");
+        }
+      } else {
+        setFixState("error");
+        setFixProgress(null);
+        setFixResult(errMsg);
+      }
     }
-  }, [selectedGuid, fixPatch, detail, fixState]);
+  }, [selectedGuid, fixPatch, detail, startFixPolling]);
+
+  /* ── Auto-resume fix state from DB on message select ───────────────── */
+  useEffect(() => {
+    if (!detail) return;
+    const st = (detail.status || "").toUpperCase();
+    const incidentId = detail.incident_id || "";
+
+    // Only auto-restore if the user hasn't manually triggered anything this session
+    if (fixState !== "idle") return;
+
+    if (["FIX_IN_PROGRESS", "RCA_IN_PROGRESS", "FIX_APPLIED_PENDING_VERIFICATION"].includes(st)) {
+      const stepLabel =
+        st === "RCA_IN_PROGRESS"                   ? "Analyzing root cause…" :
+        st === "FIX_APPLIED_PENDING_VERIFICATION"  ? "Verifying fix…" :
+                                                     "Fix in progress…";
+      setFixState("loading");
+      setFixProgress({ currentStep: stepLabel, stepIndex: 0, totalSteps: 4, stepsDone: [] });
+      if (incidentId) {
+        // Full live polling
+        pollAbortRef.current.cancelled = false;
+        startFixPolling(incidentId);
+      }
+      // No incidentId: still show the loading indicator; user can see the state
+    } else if (["AUTO_FIXED", "HUMAN_FIXED", "FIX_VERIFIED", "RETRIED"].includes(st)) {
+      setFixState("success");
+      setFixResult(detail.ai_recommendation?.fix_summary || "Fix applied and deployed.");
+    } else if (["FIX_FAILED", "PIPELINE_ERROR"].includes(st)) {
+      setFixState("error");
+      setFixResult(detail.ai_recommendation?.fix_summary || "Fix failed.");
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail]);
 
   useEffect(() => {
     return () => { pollAbortRef.current.cancelled = true; };
   }, [selectedGuid]);
-
-  /* ── Chat ──────────────────────────────────────────────────────────── */
-  const handleChat = useCallback(async () => {
-    if (!chatInput.trim() || !selectedGuid) return;
-    const userMsg = chatInput.trim();
-    setChatInput("");
-    setChatMessages((prev) => [...prev, { role: "user", text: userMsg }]);
-    setChatLoading(true);
-    try {
-      const resp = await smartMonitoringChat(userMsg, "user", selectedGuid, chatSessionId || undefined);
-      setChatSessionId(resp.session_id);
-      setChatMessages((prev) => [...prev, { role: "ai", text: resp.answer }]);
-    } catch {
-      setChatMessages((prev) => [...prev, { role: "ai", text: "Sorry, I could not process your query." }]);
-    } finally {
-      setChatLoading(false);
-    }
-  }, [chatInput, selectedGuid, chatSessionId]);
 
   /* ════════════════════════════════════════════════════════════════════
      RENDER
@@ -627,10 +685,10 @@ export default function Observability() {
     <div className={styles.page}>
 
       {/* ── AEM Status Banner ── */}
-      <div className={styles.aemBanner} data-connected={String(aemConnected)}>
+      <div className={styles.aemBanner} data-connected={String(aemConnected)} data-semp-error={String(!!sempError)}>
         <span className={styles.aemDot} />
         <span className={styles.aemBannerLabel}>
-          {aemConnected ? "AEM Connected" : "AEM Offline — incidents sourced directly from SAP CPI"}
+          {aemConnected ? "AEM Connected" : "AEM Offline"}
         </span>
         {aemConnected && (
           <>
@@ -669,27 +727,29 @@ export default function Observability() {
       {/* ══════════════════════════════════════════════════════════════════
           MESSAGES TAB
           ══════════════════════════════════════════════════════════════════ */}
-      {mainTab === "messages" && (
-        <>
+      <div style={{ display: mainTab === "messages" ? "block" : "none" }}>
           {/* ── Summary cards ── */}
           <div className={styles.summaryRow}>
-            {Object.entries(STATUS_CONFIG).slice(0, 4).map(([k, cfg]) => (
-              <div
-                key={k}
-                className={`${styles.summaryCard} ${filters.statuses.includes(k) ? styles.summaryCardActive : ""}`}
-                style={{ borderTop: `3px solid ${cfg.dot}` }}
-                onClick={() => setFilters((f) => ({
-                  ...f,
-                  statuses: f.statuses.includes(k) ? f.statuses.filter((s) => s !== k) : [...f.statuses, k],
-                }))}
-                data-tip={CARD_TIPS[k] ?? `Click to filter by ${cfg.label} status`}
-              >
-                <span className={styles.summaryCount} style={{ color: cfg.color }}>
-                  {counts[k] ?? 0}
-                </span>
-                <span className={styles.summaryLabel} style={{ color: cfg.color }}>{cfg.label}</span>
-              </div>
-            ))}
+            {SUMMARY_CARD_KEYS.map((k) => {
+              const cfg = STATUS_CONFIG[k];
+              return (
+                <div
+                  key={k}
+                  className={`${styles.summaryCard} ${filters.statuses.includes(k) ? styles.summaryCardActive : ""}`}
+                  style={{ borderTop: `3px solid ${cfg.dot}` }}
+                  onClick={() => setFilters((f) => ({
+                    ...f,
+                    statuses: f.statuses.includes(k) ? f.statuses.filter((s) => s !== k) : [...f.statuses, k],
+                  }))}
+                  data-tip={CARD_TIPS[k] ?? `Click to filter by ${cfg.label} status`}
+                >
+                  <span className={styles.summaryCount} style={{ color: cfg.color }}>
+                    {counts[k] ?? 0}
+                  </span>
+                  <span className={styles.summaryLabel} style={{ color: cfg.color }}>{cfg.label}</span>
+                </div>
+              );
+            })}
           </div>
 
           {/* ── Filters ── */}
@@ -764,7 +824,7 @@ export default function Observability() {
                 <div className={styles.messageList}>
                   {messages.map((msg, i) => {
                     const cfg = STATUS_CONFIG[msg.status?.toUpperCase()] ?? STATUS_CONFIG.FAILED;
-                    const isSelected = selectedGuid === msg.message_guid;
+                    const isSelected = selectedGuid !== null && selectedGuid === msg.message_guid;
                     return (
                       <div
                         key={msg.message_guid || i}
@@ -795,7 +855,7 @@ export default function Observability() {
                 {/* Header */}
                 <div className={styles.detailHeader}>
                   <div className={styles.detailHeaderLeft}>
-                    <h3 className={styles.detailTitle}>
+                    <h3 className={styles.detailTitle} title={detail?.iflow_display || selectedGuid || undefined}>
                       {detail?.iflow_display || selectedGuid}
                     </h3>
                     <StatusPill status={detail?.status || "FAILED"} />
@@ -967,11 +1027,9 @@ export default function Observability() {
                                       {fixState === "success" && "Fix Applied"}
                                       {fixState === "error"   && "Retry Fix"}
                                     </button>
-                                    {fixResult && (
-                                      <span className={styles.fixResultText}>{fixResult}</span>
-                                    )}
                                   </div>
                                 )}
+
                               </div>
                             ) : (
                               /* Generate Fix Patch button */
@@ -989,42 +1047,45 @@ export default function Observability() {
                               )
                             )}
 
-                            {/* Chat section */}
-                            <div className={styles.chatSection}>
-                              {chatMessages.length > 0 && (
-                                <div className={styles.chatMessages}>
-                                  {chatMessages.map((m, i) => (
-                                    <div key={i} className={`${styles.chatMsg} ${styles[`chatMsg_${m.role}`]}`}>
-                                      <span className={styles.chatRole}>{m.role === "user" ? "You" : "AI"}:</span>
-                                      <span>{m.text}</span>
+                            {/* Fix progress / result — always visible, restored from DB even after page reload */}
+                            {fixState !== "idle" && (
+                              <div className={styles.fixStatusSection}>
+                                {fixState === "loading" && fixProgress && (
+                                  <div className={styles.fixProgressBox}>
+                                    <div className={styles.fixProgressHeader}>
+                                      <span className={styles.fixProgressSpinner}>↻</span>
+                                      <span className={styles.fixProgressStep}>
+                                        {fixProgress.stepIndex > 0
+                                          ? `Step ${fixProgress.stepIndex} of ${fixProgress.totalSteps}`
+                                          : "Starting…"}
+                                      </span>
                                     </div>
-                                  ))}
-                                  {chatLoading && <div className={styles.chatLoading}>AI is thinking...</div>}
-                                </div>
-                              )}
-                              <div className={styles.chatInputRow}>
-                                <input
-                                  className={styles.chatInput}
-                                  placeholder="Ask your queries here"
-                                  value={chatInput}
-                                  onChange={(e) => setChatInput(e.target.value)}
-                                  onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleChat()}
-                                  disabled={chatLoading}
-                                  title="Ask questions about this incident — context is maintained across the conversation"
-                                />
-                                <button
-                                  className={styles.chatSendBtn}
-                                  onClick={handleChat}
-                                  disabled={chatLoading || !chatInput.trim()}
-                                  data-tip="Send your question to the AI assistant"
-                                >
-                                  Send
-                                </button>
+                                    <div className={styles.fixProgressMessage}>{fixProgress.currentStep}</div>
+                                    {fixProgress.stepIndex > 0 && (
+                                      <div className={styles.fixProgressTrack}>
+                                        <div
+                                          className={styles.fixProgressFill}
+                                          style={{ width: `${Math.round((fixProgress.stepIndex / fixProgress.totalSteps) * 100)}%` }}
+                                        />
+                                      </div>
+                                    )}
+                                    {fixProgress.stepsDone.length > 0 && (
+                                      <div className={styles.fixProgressDone}>
+                                        {fixProgress.stepsDone.map((s, i) => (
+                                          <span key={i} className={styles.fixProgressDoneItem}>✓ {s}</span>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                                {fixResult && (
+                                  <div className={`${styles.fixResultBanner} ${styles[`fixResultBanner_${fixState}`] || ""}`}>
+                                    {fixResult}
+                                  </div>
+                                )}
                               </div>
-                              <div className={styles.aiDisclaimer}>
-                                The response provided is generated by an AI system. User is advised to independently verify the information prior to applying it in any production or decision-making context.
-                              </div>
-                            </div>
+                            )}
+
                           </>
                         )}
                       </div>
@@ -1124,8 +1185,7 @@ export default function Observability() {
               </div>
             )}
           </div>
-        </>
-      )}
+      </div>
 
       {/* ══════════════════════════════════════════════════════════════════
           TICKETS TAB
@@ -1192,7 +1252,7 @@ export default function Observability() {
                       <span className={`${styles.badge} ${styles[`priority_${ticket.priority.toLowerCase()}`]}`}>
                         {ticket.priority}
                       </span>
-                      <span className={`${styles.badge} ${styles[`status_${ticket.status.toLowerCase()}`]}`}>
+                      <span className={`${styles.badge} ${styles[`status_${ticket.status.toLowerCase().replace(/\s+/g, '_')}`]}`}>
                         {ticket.status}
                       </span>
                     </div>
@@ -1237,6 +1297,13 @@ export default function Observability() {
               {approvalsLoading ? "Loading..." : "Refresh"}
             </button>
           </div>
+
+          {approvalActionError && (
+            <div className={styles.approvalErrorBanner}>
+              {approvalActionError}
+              <button onClick={() => setApprovalActionError(null)} aria-label="Dismiss">✕</button>
+            </div>
+          )}
 
           {/* KPI Cards for Approvals */}
           {!approvalsLoading && approvals.length > 0 && (
