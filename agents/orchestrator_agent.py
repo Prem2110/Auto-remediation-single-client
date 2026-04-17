@@ -783,6 +783,7 @@ Rules:
             })
 
         # ── Unfixable detection ───────────────────────────────────────────────
+        # Signals that are unfixable regardless of where they appear (fix hint OR root cause).
         _unfixable_signals = [
             "jsonslurper", "try/catch", "try {", "groovy script", "switch to",
             "rewrite the script", "modify the script", "update the script",
@@ -792,11 +793,18 @@ Rules:
             "add a converter", "add json-to-xml", "add xml-to-json",
             "upstream", "payload is not valid json", "empty payload",
             "payload is empty", "non-json payload", "invalid json payload",
-            "content-type mismatch", "backend returns", "backend response",
+            "content-type mismatch",
         ]
+        # Signals that are only unfixable when the PROPOSED FIX itself requires a backend
+        # change. "backend response" / "backend returns" in the ROOT CAUSE merely describe
+        # what the backend did — the adapter configuration may still be fixable via iFlow XML.
+        _fix_only_signals = ["backend returns", "backend response"]
         _fix_hint   = (rca.get("proposed_fix") or "").lower()
         _rc_hint    = (rca.get("root_cause") or "").lower()
-        _unfixable  = next((s for s in _unfixable_signals if s in _fix_hint or s in _rc_hint), None)
+        _unfixable  = (
+            next((s for s in _unfixable_signals if s in _fix_hint or s in _rc_hint), None)
+            or next((s for s in _fix_only_signals if s in _fix_hint), None)
+        )
         if _unfixable and not deploy_only:
             _reason = (
                 f"Auto-fix skipped: the root cause requires changes that cannot be safely applied "
@@ -1426,6 +1434,21 @@ Rules:
         incident = get_incident_by_id(incident_id)
         if not incident:
             logger.error("[Orchestrator:fix] Incident %s not found in DB", incident_id)
+            return
+        # Guard: skip verification if the fix agent never successfully applied the change.
+        # Without this check, a FIX_FAILED_UPDATE incident would be re-tested against the
+        # unchanged iFlow and incorrectly promoted to FIX_FAILED_RUNTIME.
+        current_status = incident.get("status", "")
+        _fix_not_applied = {
+            "FIX_FAILED_UPDATE", "FIX_FAILED_DEPLOY", "FIX_FAILED",
+            "ARTIFACT_MISSING", "TICKET_CREATED",
+        }
+        if current_status in _fix_not_applied:
+            logger.warning(
+                "[Orchestrator:fix] Skipping verification — fix was not applied: "
+                "incident=%s current_status=%s",
+                incident_id, current_status,
+            )
             return
         result = await self._verifier.test_iflow_after_fix(dict(incident))
         final_status = "FIX_VERIFIED" if result.get("test_passed") else "FIX_FAILED_RUNTIME"

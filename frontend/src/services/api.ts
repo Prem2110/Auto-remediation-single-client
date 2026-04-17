@@ -1,7 +1,7 @@
 const _BASE = import.meta.env.VITE_API_BASE ?? "/api";
 
 export const API_PRIMARY =
-  import.meta.env.VITE_API_PRIMARY ?? "https://pipoflow.cfapps.us10-001.hana.ondemand.com";
+  import.meta.env.VITE_API_PRIMARY ?? "https://ND-ORBIT.cfapps.us10-001.hana.ondemand.com";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {

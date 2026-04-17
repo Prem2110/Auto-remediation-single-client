@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { useState } from "react";
 import {
   PieChart, Pie, Cell, Tooltip, Legend, ResponsiveContainer,
@@ -7,7 +7,6 @@ import {
 } from "recharts";
 import {
   fetchDashboardAll,
-  fetchQueueStats,
   fetchFailedMessagesPaginated,
   fetchActiveIncidentsPaginated,
   type PaginatedMessagesResponse,
@@ -20,15 +19,6 @@ import styles from "./dashboard.module.css";
 const CHART_COLORS = ["#ff6b6b", "#4dabf7", "#ffd43b", "#69db7c", "#845ef7", "#f06595", "#74c0fc"];
 
 // ── Formatters ────────────────────────────────────────────────────────────────
-function formatODataDate(value: string | null | undefined): string {
-  if (!value) return "-";
-  const match = /\/Date\((\d+)\)\//.exec(value);
-  if (!match) return value;
-  return new Date(parseInt(match[1], 10)).toLocaleTimeString("en-GB", {
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-  });
-}
-
 function formatISODate(value: string | null | undefined): string {
   if (!value) return "-";
   const d = new Date(value);
@@ -123,7 +113,7 @@ function SkeletonRows({ count = 5 }: { count?: number }) {
 export default function Dashboard() {
   // Chart/KPI data auto-refreshes every 60s; paginated tables do not.
   const chartOpts = { refetchInterval: 60_000, retry: 3, retryDelay: 3_000 } as const;
-  const tableOpts = { retry: 2, retryDelay: 2_000, placeholderData: (prev: unknown) => prev } as const;
+  const tableOpts = { retry: 2, retryDelay: 2_000, placeholderData: keepPreviousData };
 
   // ─ Fetch consolidated dashboard data (charts, KPIs, AEM stats) ────────────────
   const { data: dashData, isLoading: dashLoading } = useQuery({

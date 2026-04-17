@@ -32,8 +32,7 @@ export default defineConfig({
       output: {
         manualChunks: {
           // SAP UI5 WebComponents — largest chunk, loaded once and cached
-          "ui5-core":    ["@ui5/webcomponents", "@ui5/webcomponents-react"],
-          "ui5-fiori":   ["@ui5/webcomponents-fiori"],
+          "ui5-core":    ["@ui5/webcomponents-react"],
           // Recharts only needed on Dashboard
           "recharts":    ["recharts"],
           // React ecosystem
