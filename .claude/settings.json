@@ -30,7 +30,8 @@
       "Bash(python3 -c \"import solace_pubsubplus\")",
       "Bash(python3 -c \"import solace\")",
       "Bash(pip index *)",
-      "Bash(xargs grep *)"
+      "Bash(xargs grep *)",
+      "Bash(find \"/c/Users/PremkumarUthayakumar/Desktop/projects/New folder/auto-remediation\" -name \"*.py\" -type f ! -path \".venv/*\" -exec grep -l \"open\\\\|logger\\\\|log\\\\|pkl\\\\|pickle\\\\|sqlite\\\\|write\\\\|append\" {} \\\\;)"
     ],
     "additionalDirectories": [
       "c:\\Users\\PremkumarUthayakumar\\Desktop\\projects\\New folder\\auto-remediation"
