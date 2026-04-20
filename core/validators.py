@@ -48,6 +48,10 @@ def _extract_iflow_file(snapshot_str: str) -> tuple[str, str]:
             return m.group(1), ""
     except Exception:
         pass
+    # Last resort: if the response itself is raw iFlow XML (starts with <), use it directly.
+    stripped = (snapshot_str or "").strip()
+    if stripped.startswith("<") and "bpmn" in stripped.lower():
+        return "", stripped
     return "", ""
 
 
@@ -164,7 +168,9 @@ def _check_iflow_xml(original_xml: str, modified_xml: str) -> List[str]:
                         f"declare namespace {missing[0]}='http://...'; //{missing[0]}:element"
                     )
 
-    # ── Check 5 — Content Modifier header rows must use srcType="Expression" ──
+    # ── Check 5 — Content Modifier: dynamic-looking values must NOT use srcType="Constant" ──
+    # Note: srcType="Constant" is valid in SAP CPI for literal strings (e.g. "application/json").
+    # Only flag when the value contains expression syntax (${...}, XPath //) but is marked Constant.
     for task in mod_root.iter(f"{{{_BPMN2}}}serviceTask"):
         ext = task.find(f"{{{_BPMN2}}}extensionElements")
         if ext is None:
@@ -176,11 +182,19 @@ def _check_iflow_xml(original_xml: str, modified_xml: str) -> List[str]:
             v = p.findtext(f"{{{_IFL}}}value") or p.findtext("value") or ""
             kv[k] = v
         if "headerName" in kv and kv.get("srcType", "") == "Constant":
-            errors.append(
-                f"Content Modifier step '{task.get('id', '?')}' has a header row with "
-                f"srcType='Constant'. Header rows MUST use srcType='Expression'. "
-                f"Change srcType value to 'Expression'."
+            src_val = kv.get("srcValue", kv.get("expression", kv.get("value", "")))
+            is_dynamic = (
+                "${" in src_val
+                or src_val.startswith("//")
+                or src_val.startswith("$.")
+                or re.search(r'\$\{[^}]+\}', src_val)
             )
+            if is_dynamic:
+                errors.append(
+                    f"Content Modifier step '{task.get('id', '?')}' has a header row with "
+                    f"srcType='Constant' but the value '{src_val[:80]}' looks like a dynamic expression. "
+                    f"Change srcType to 'Expression' for dynamic values."
+                )
 
     # ── Check 6 — every exclusiveGateway (CBR) must have a default route ──
     for gw in mod_root.iter(f"{{{_BPMN2}}}exclusiveGateway"):
@@ -245,6 +259,9 @@ def validate_before_update_iflow(args: Dict) -> List[str]:
     if isinstance(files, list) and files:
         submitted_filepath = files[0].get("filepath", "") if isinstance(files[0], dict) else ""
         submitted_xml      = files[0].get("content", "")  if isinstance(files[0], dict) else ""
+    elif args.get("content"):
+        # update-iflow called with a direct content= field (e.g. rollback path, validate tool)
+        submitted_xml = args["content"]
 
     # Check filepath matches original exactly
     if original_filepath and submitted_filepath and submitted_filepath != original_filepath:

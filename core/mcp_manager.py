@@ -424,13 +424,14 @@ Execution policy:
             }
 
         output = await self.execute("integration_suite", mcp_tool_name, args)
-        failed = str(output).startswith("ERROR:")
+        out_str = str(output)
+        failed = out_str.startswith("ERROR:") or out_str.startswith("VALIDATION FAILED")
         return {
             "success": not failed,
             "tool":    mcp_tool_name,
             "args":    args,
             "output":  output,
-            "error":   str(output) if failed else "",
+            "error":   out_str if failed else "",
         }
 
     # ── memory ───────────────────────────────

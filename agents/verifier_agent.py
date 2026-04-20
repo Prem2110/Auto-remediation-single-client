@@ -82,19 +82,38 @@ class VerifierAgent:
         if not verify_tools:
             verify_tools = [t for t in self._mcp.tools if t.server == "mcp_testing"]
 
+        # Add get-iflow (read-only) so the verifier can inspect the iFlow's payload schema
+        # before constructing a test payload — this prevents schema-blind guessing.
+        get_iflow_tool = next(
+            (t for t in self._mcp.tools if t.mcp_tool_name == "get-iflow"),
+            None,
+        )
+        if get_iflow_tool:
+            verify_tools = [get_iflow_tool] + verify_tools
+
         all_tools = [check_iflow_runtime_status] + verify_tools
 
         system_prompt = """You are an SAP CPI post-fix verification agent.
 
-Your job is to verify that a deployed fix works:
-1. Call check_iflow_runtime_status to confirm the iFlow is in Started state.
-2. Use retry/replay tools to resubmit the original failed message (if message GUID provided).
-3. Use test_iflow_with_payload to send a test payload to the iFlow (if HTTP endpoint available).
+Your job is to verify that a deployed fix works. Execute in order:
+1. Call check_iflow_runtime_status to confirm the iFlow is in Started (not Error) state.
+   - If status is ERROR or STOPPED: return test_passed=false immediately.
+2. Call get_iflow_endpoint to discover whether the iFlow has an HTTP trigger.
+   - If NO HTTP endpoint (count=0, SFTP, File, Scheduler):
+     Runtime status check from step 1 IS the verification.
+     Return: {"test_passed": true, "http_status": null, "summary": "Non-HTTP iFlow confirmed in Started state post-fix."}
+   - If YES HTTP endpoint: proceed to step 3.
+3. Call get-iflow to read the iFlow configuration. From the iFlow XML:
+   - Identify the sender channel type (REST/SOAP/HTTP).
+   - Find any message mapping or schema step to infer required field names and payload structure.
+   - Use ONLY confirmed field names from the iFlow — never guess field names.
+4. Call test_iflow_with_payload ONCE using the payload you constructed from the iFlow schema.
+5. Return EXACTLY this JSON (no markdown):
+   {"test_passed": true/false, "http_status": <code or null>, "summary": "<one sentence: payload structure used and what the iFlow returned>"}
 
-Do NOT call get-iflow, update-iflow, or deploy-iflow.
+Do NOT call update-iflow or deploy-iflow.
 Do NOT modify any iFlow.
-Make at most 3 tool calls total, then return your result as JSON:
-{"test_passed": true/false, "http_status": <code or null>, "summary": "..."}
+Maximum 5 tool calls total.
 """
         self._agent = await self._mcp.build_agent(
             tools=all_tools,
@@ -178,25 +197,34 @@ Rules:
         error_msg    = incident.get("error_message", "")
         proposed_fix = incident.get("proposed_fix", "")
 
-        prompt = f"""IFLOW VERIFICATION — the fix has been deployed. Confirm it works with one test call.
+        prompt = f"""IFLOW VERIFICATION — the fix has been deployed. Confirm it works.
 
-iFlow ID: {iflow_id}
-Original error type: {error_type}
-Original error: {error_msg[:400]}
-Applied fix: {proposed_fix[:400]}
+iFlow ID:     {iflow_id}
+Error type:   {error_type}
+Original error (truncated): {error_msg[:400]}
+Applied fix:  {proposed_fix[:400]}
 
-INSTRUCTIONS:
-1. Call get_iflow_endpoint with iflow_id='{iflow_id}' to discover the HTTP endpoint.
-   - If it returns 0 endpoints, count=0, or "unable to fetch", the iFlow has no HTTP trigger
-     (it may be SFTP, File, or scheduler-triggered). Immediately return:
-     {{"test_passed": false, "http_status": null, "summary": "iFlow has no HTTP endpoint — test not applicable."}}
-     Do NOT call test_iflow_with_payload in this case.
-2. If an endpoint IS found, construct a minimal valid payload from the error context above
-   and call test_iflow_with_payload once with iflow_id='{iflow_id}' and that payload.
-3. Return EXACTLY this JSON (no markdown):
-{{"test_passed": true/false, "http_status": <status code or null>, "summary": "<one sentence: what was sent and what the iFlow returned>"}}
+INSTRUCTIONS — execute in order, stop early if a step gives a definitive result:
+1. Call check_iflow_runtime_status for iflow_id='{iflow_id}'.
+   - If status is ERROR or STOPPED: return immediately:
+     {{"test_passed": false, "http_status": null, "summary": "iFlow is in <status> state after deploy — fix did not recover it."}}
+2. Call get_iflow_endpoint for iflow_id='{iflow_id}' to discover the HTTP trigger.
+   - If no HTTP endpoint (count=0 / SFTP / File / Scheduler-triggered):
+     Runtime status = Started is sufficient confirmation. Return:
+     {{"test_passed": true, "http_status": null, "summary": "Non-HTTP iFlow confirmed in Started state post-fix — no payload test required."}}
+     Do NOT call test_iflow_with_payload.
+3. If an HTTP endpoint IS found:
+   a. Call get-iflow with iflow_id='{iflow_id}' to read the iFlow configuration.
+      - Identify the sender channel type (REST / SOAP / HTTPS).
+      - Look at message mapping steps or Content Modifier steps to find field names used in the payload.
+      - Use ONLY field names you observed in the iFlow XML — do NOT guess or invent field names.
+   b. Construct a minimal test payload using the field names and structure you observed.
+   c. Call test_iflow_with_payload ONCE with iflow_id='{iflow_id}' and the schema-based payload.
+4. Return EXACTLY this JSON (no markdown):
+{{"test_passed": true/false, "http_status": <status code or null>, "summary": "<what payload structure was sent and what the iFlow returned>"}}
 
-Do NOT call get-iflow. Do NOT modify the iFlow. Do NOT call deploy. Do NOT fetch message logs.
+Do NOT call update-iflow. Do NOT call deploy-iflow. Do NOT modify the iFlow.
+Maximum 5 tool calls total.
 """
         timestamp = get_hana_timestamp()
         tracker   = TestExecutionTracker(
@@ -209,7 +237,7 @@ Do NOT call get-iflow. Do NOT modify the iFlow. Do NOT call deploy. Do NOT fetch
             result    = await asyncio.wait_for(
                 agent.ainvoke(
                     {"messages": [{"role": "user", "content": prompt}]},
-                    config={"callbacks": [logger_cb], "recursion_limit": 6},
+                    config={"callbacks": [logger_cb], "recursion_limit": 10},
                 ),
                 timeout=120.0,
             )

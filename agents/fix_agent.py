@@ -66,7 +66,7 @@ class FixAgent:
     async def build_agent(self) -> None:
         """Build a fix+deploy agent with local validate_iflow_xml @tool + 3 specific MCP tools."""
         from langchain_core.tools import tool as _tool   # noqa: PLC0415
-        from core.validators import validate_before_update_iflow as _validate  # noqa: PLC0415
+        from core.validators import _check_iflow_xml, _fix_ctx as _validator_ctx  # noqa: PLC0415
 
         @_tool
         def validate_iflow_xml(xml_content: str) -> str:
@@ -75,7 +75,9 @@ class FixAgent:
             Runs 7 structural checks (namespace, BPMN shape IDs, property files, etc.).
             Returns 'VALID' or 'ERRORS: <list>'.
             """
-            errors = _validate({"content": xml_content})
+            ctx = _validator_ctx.get()
+            original_xml = ctx.get("xml", "") if ctx else ""
+            errors = _check_iflow_xml(original_xml, xml_content)
             if not errors:
                 return "VALID"
             return "ERRORS: " + " | ".join(errors)
@@ -236,15 +238,33 @@ Must do:
         def compact(text: str) -> str:
             return re.sub(r"\s+", " ", str(text or "")).strip()[:500]
 
-        update_ok = False
-        deploy_ok = False
-        update_output = deploy_output = ""
+        update_ok         = False
+        deploy_ok         = False
+        update_output     = deploy_output = ""
+        validation_called = False
+        validation_failed = False
         for step in steps:
             tool_name = str(step.get("tool", ""))
             output    = str(step.get("output", ""))
-            if "update_iflow" in tool_name or "update-iflow" in tool_name:
+            if "validate_iflow_xml" in tool_name:
+                validation_called = True
+                if "ERRORS:" in output:
+                    validation_failed = True
+                    logger.warning(
+                        "[FIX_DEPLOY] validate_iflow_xml returned errors but agent may still update: %s",
+                        compact(output),
+                    )
+            elif "update_iflow" in tool_name or "update-iflow" in tool_name:
                 update_output = output
                 update_ok     = self._update_succeeded(output)
+                if update_ok and not validation_called:
+                    logger.warning(
+                        "[FIX_DEPLOY] update-iflow succeeded without prior validate_iflow_xml call"
+                    )
+                elif update_ok and validation_failed:
+                    logger.warning(
+                        "[FIX_DEPLOY] update-iflow called despite validate_iflow_xml reporting ERRORS"
+                    )
             elif "deploy_iflow" in tool_name or "deploy-iflow" in tool_name:
                 deploy_output = output
                 deploy_ok     = self._deploy_succeeded(output)
@@ -271,11 +291,16 @@ Must do:
                 "summary": "iFlow content was updated but deployment did not complete successfully.",
                 "failed_steps": ["deploy-iflow"],
             }
+        _validation_note = ""
+        if not validation_called:
+            _validation_note = " [warn: XML validation step was skipped by agent]"
+        elif validation_failed:
+            _validation_note = " [warn: agent proceeded despite XML validation errors]"
         return {
             "success": True, "fix_applied": True, "deploy_success": True,
             "failed_stage": None,
-            "technical_details": "",
-            "summary": f"iFlow updated and deployed successfully. {compact(answer)}",
+            "technical_details": _validation_note.strip(),
+            "summary": f"iFlow updated and deployed successfully. {compact(answer)}{_validation_note}",
             "failed_steps": [],
         }
 
@@ -483,6 +508,29 @@ Must do:
         tracker   = TestExecutionTracker(user_id, f"fix:{iflow_id}", timestamp)
         logger_cb = StepLogger(tracker, progress_fn=progress_fn)
 
+        # Capture original iFlow XML for rollback AND set _fix_ctx for the validator.
+        # This ensures validate_before_update_iflow has the snapshot even on the /query path.
+        _original_xml: Optional[str] = None
+        _original_filepath: Optional[str] = None
+        try:
+            _get_result = await self._mcp.execute_integration_tool("get-iflow", {"id": iflow_id})
+            if _get_result.get("success"):
+                _out = _get_result.get("output", "")
+                _out_str = _out if isinstance(_out, str) else json.dumps(_out)
+                _fp, _xml = _extract_iflow_file(_out_str)
+                if _fp and _xml:
+                    _original_filepath = _fp
+                    _original_xml      = _xml
+                    _fix_ctx.set({"filepath": _fp, "xml": _xml})
+                    logger.debug(
+                        "[FIX_DEPLOY] Snapshot captured: filepath=%s xml_len=%d",
+                        _fp, len(_xml),
+                    )
+                elif _out_str:
+                    _original_xml = _out_str
+        except Exception as _pre_exc:
+            logger.debug("[FIX_DEPLOY] Pre-fetch for rollback/snapshot failed (non-fatal): %s", _pre_exc)
+
         result: Optional[Dict] = None
         for attempt in range(3):
             try:
@@ -629,6 +677,36 @@ Must do:
                     except Exception as corr_exc:
                         logger.error("[FIX_DEPLOY] Self-correction pass %d error: %s", _pass, corr_exc)
                         break
+
+            # ── Rollback: restore original XML if update succeeded but deploy never did ──
+            if (
+                _original_xml
+                and iflow_id
+                and evaluation.get("fix_applied")
+                and not evaluation.get("deploy_success")
+            ):
+                logger.warning(
+                    "[FIX_DEPLOY] Deploy failed after all passes — rolling back iFlow '%s' to original XML",
+                    iflow_id,
+                )
+                try:
+                    # Use the proper files array format when filepath is known;
+                    # raw content= is a fallback only when we couldn't extract the filepath.
+                    if _original_filepath:
+                        _rb_args = {
+                            "id":    iflow_id,
+                            "files": [{"filepath": _original_filepath, "content": _original_xml}],
+                        }
+                    else:
+                        _rb_args = {"id": iflow_id, "content": _original_xml}
+                    rb = await self._mcp.execute_integration_tool("update-iflow", _rb_args)
+                    if rb.get("success"):
+                        logger.info("[FIX_DEPLOY] Rollback succeeded for iFlow '%s'", iflow_id)
+                        evaluation["summary"] += " (original XML restored after failed deploy)"
+                    else:
+                        logger.error("[FIX_DEPLOY] Rollback failed for iFlow '%s': %s", iflow_id, rb.get("output", ""))
+                except Exception as _rb_exc:
+                    logger.error("[FIX_DEPLOY] Rollback exception for iFlow '%s': %s", iflow_id, _rb_exc)
 
         self._mcp.update_memory(session_id, f"Fix {iflow_id}", evaluation["summary"])
         logger.info(

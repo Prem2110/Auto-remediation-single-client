@@ -52,6 +52,7 @@ class VectorStoreRetriever:
         self.embed_deployment = os.getenv("EMBEDDING_DEPLOYMENT_ID")
         self.vector_dim = int(os.getenv("VECTOR_DIMENSION", "3072"))
         self.enabled    = all([self.host, self.user, self.password, self.schema, self.table])
+        self._conn: Optional[dbapi.Connection] = None  # persistent connection
 
         if not self.enabled:
             logger.warning(
@@ -67,12 +68,36 @@ class VectorStoreRetriever:
 
     # ── Connection ────────────────────────────────────────────────────────────
 
+    def _is_connection_alive(self) -> bool:
+        """Cheaply test if the persistent connection is still usable."""
+        if self._conn is None:
+            return False
+        try:
+            cur = self._conn.cursor()
+            cur.execute("SELECT 1 FROM DUMMY")
+            cur.close()
+            return True
+        except Exception:
+            return False
+
     def _get_connection(self) -> Optional[dbapi.Connection]:
-        """Open HANA Cloud connection, set schema. Returns None on failure."""
+        """
+        Return the persistent HANA connection, reconnecting if it is dead.
+        Opening one TCP connection per VectorStoreRetriever instance avoids
+        exhausting HANA connection limits under concurrent RCA load.
+        """
         if not self.enabled:
             return None
+        if self._is_connection_alive():
+            return self._conn
+        # Connection is absent or stale — (re)connect
         try:
-            conn = dbapi.connect(
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            self._conn = dbapi.connect(
                 address=self.host,
                 port=self.port,
                 user=self.user,
@@ -80,12 +105,13 @@ class VectorStoreRetriever:
                 encrypt=True,
                 **{"sslValidateCertificate": False},
             )
-            cur = conn.cursor()
+            cur = self._conn.cursor()
             cur.execute(f'SET SCHEMA "{self.schema}"')
             cur.close()
-            return conn
+            return self._conn
         except Exception as exc:
             logger.error("[VectorStore] HANA connection failed | error=%s", exc)
+            self._conn = None
             return None
 
     # ── Embedding ─────────────────────────────────────────────────────────────
@@ -258,11 +284,8 @@ class VectorStoreRetriever:
 
         except Exception as exc:
             logger.error("[VectorStore] Retrieval error | error=%s", exc)
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            # Mark connection as dead so next call reconnects
+            self._conn = None
 
         if results:
             logger.info(

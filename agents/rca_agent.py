@@ -212,7 +212,7 @@ Return exactly:
         # ── Prompt — two variants depending on whether we have a message GUID ─
         if message_guid:
             prompt = f"""
-AUTONOMOUS RCA — do NOT ask for human input. Maximum 4 tool calls total.
+AUTONOMOUS RCA — do NOT ask for human input. Maximum 8 tool calls total.
 
 Error detected:
 - iFlow:      {iflow_id}
@@ -276,7 +276,7 @@ Return ONLY valid JSON (no markdown, no preamble):
             try:
                 result = await agent.ainvoke(
                     {"messages": messages},
-                    config={"callbacks": [logger_cb], "recursion_limit": 10},
+                    config={"callbacks": [logger_cb], "recursion_limit": 14},
                 )
                 final_msg = result["messages"][-1]
                 answer    = final_msg.content if hasattr(final_msg, "content") else str(final_msg)

@@ -129,13 +129,21 @@ FIX_INTENT_KEYWORDS = (
 
 FALLBACK_FIX_BY_ERROR_TYPE: Dict[str, str] = {
     "MAPPING_ERROR": (
-        "Open the affected message mapping in the iFlow and replace invalid target/source field references. "
-        "Refresh the source and target structures, update renamed or missing fields, validate the mapping, "
-        "then redeploy the iFlow."
+        "In the iFlow XML, locate the failing <bpmn2:serviceTask> element for the mapping step. "
+        "Inspect its <ifl:property> entries for source/target field references. "
+        "If a field was renamed or removed, update the XPath expression or field reference in that property. "
+        "For namespace errors: declare the namespace inline in the XPath value using "
+        "'declare namespace prefix=\\'uri\\'; //prefix:element'. "
+        "Apply only the minimal property-level change. Call validate_iflow_xml, then update-iflow, then deploy-iflow."
     ),
     "DATA_VALIDATION": (
-        "Add validation before the mapping or receiver step. Ensure mandatory fields are present, handle nulls, "
-        "and route invalid payloads to an exception subprocess or dead-letter handling before redeploying."
+        "In the iFlow XML, locate the Content Modifier or mapping step that rejects the payload. "
+        "To add a null/empty guard: set a property using XPath "
+        "'string-length(normalize-space(/ns:root/ns:field)) > 0'. "
+        "To add a default value: add an <ifl:property name='CamelHttpMethod'> or use a Content Modifier "
+        "step's Header/Property section to set a fallback. "
+        "Apply as a property-level change on the existing step — do NOT add new structural components. "
+        "Call validate_iflow_xml, then update-iflow, then deploy-iflow."
     ),
     "AUTH_ERROR": (
         "Verify the credential alias, OAuth configuration, certificates, and security material used by the receiver "

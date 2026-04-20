@@ -172,6 +172,8 @@ async def lifespan(app: FastAPI):
                 _verifier.build_agent(),
             )
             await orchestrator.build_agent(observer=observer)  # depends on all above being ready
+            orchestrator._agents_ready = True
+            logger.info("[Startup] All specialist agents built — orchestrator ready to process messages.")
 
             # ── AEM inbound webhook subscription ──────────────────────────────
             async def _on_observed_event(event: dict) -> None:
@@ -312,9 +314,12 @@ async def query_endpoint(
 
         fix_triggered = False
         if _has_fix_intent(req.query):
-            pending  = get_all_incidents(status="AWAITING_APPROVAL", limit=5)
-            rca_done = get_all_incidents(status="RCA_COMPLETE", limit=5)
-            candidates = pending + rca_done
+            pending     = get_all_incidents(status="AWAITING_APPROVAL", limit=5)
+            rca_done    = get_all_incidents(status="RCA_COMPLETE", limit=5)
+            fix_failed  = get_all_incidents(status="FIX_FAILED", limit=5)
+            fix_failed_deploy = get_all_incidents(status="FIX_FAILED_DEPLOY", limit=3)
+            fix_failed_update = get_all_incidents(status="FIX_FAILED_UPDATE", limit=3)
+            candidates  = pending + rca_done + fix_failed + fix_failed_deploy + fix_failed_update
 
             matched_incident = None
             for inc in candidates:

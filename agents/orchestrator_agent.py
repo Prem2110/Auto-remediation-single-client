@@ -99,6 +99,9 @@ class OrchestratorAgent:
         self._classifier = ClassifierAgent()
         self._observer   = None
         self._agent      = None
+        self._agents_ready: bool = False  # set True after all specialist agents finish build_agent()
+        # Per-iFlow mutex: prevents two concurrent fix pipelines writing to the same SAP CPI artifact
+        self._iflow_fix_locks: Dict[str, asyncio.Lock] = {}
         # Autonomous queue-polling loop
         self._autonomous_task:    Optional[asyncio.Task] = None
         self._autonomous_running: bool                   = False
@@ -247,7 +250,13 @@ Rules:
             tools=[run_observer, run_classifier, run_rca, run_fix, run_verifier],
             system_prompt=system_prompt,
         )
+        self._agents_ready = True
         logger.info("[Orchestrator] LangChain agent ready (5 specialist @tool wrappers).")
+
+    def _get_iflow_fix_lock(self, iflow_id: str) -> asyncio.Lock:
+        if iflow_id not in self._iflow_fix_locks:
+            self._iflow_fix_locks[iflow_id] = asyncio.Lock()
+        return self._iflow_fix_locks[iflow_id]
 
     # ────────────────────────────────────────────
     # ROUTING / POLICY HELPERS
@@ -408,47 +417,71 @@ Rules:
             and rca.get("error_type", "UNKNOWN_ERROR") != "UNKNOWN_ERROR"
         )
         if self.should_auto_fix(incident, rca, policy, confidence) or effective_auto_fix:
-            logger.info("[Gate] AUTO-FIX (%.2f) → %s", confidence, incident["iflow_id"])
-            fix_result   = await self._fix.apply_fix(incident, rca)
-            fix_summary  = fix_result.get("summary", "")
-            retry_result = None
-            if fix_result["success"] and policy.get("replay_after_fix"):
-                retry_result = await self._verifier.retry_failed_message(incident)
-                if retry_result.get("summary"):
-                    fix_summary = f"{fix_summary}\nRetry: {retry_result['summary']}"
-            final_status = self._fix.determine_post_fix_status(
-                fix_result["success"], policy,
-                retry_result=retry_result, human_approved=False,
-                failed_stage=fix_result.get("failed_stage", ""),
-            )
-            _resolved = final_status in {"FIX_VERIFIED", "HUMAN_INITIATED_FIX"}
-            update_incident(incident["incident_id"], {
-                "status":               final_status,
-                "fix_summary":          fix_summary,
-                "resolved_at":          get_hana_timestamp() if _resolved else None,
-                "verification_status":  "VERIFIED" if _resolved else "PENDING",
-            })
-            # ── Dispatch verification directly — no Solace round-trip ─────────
-            asyncio.create_task(self._handle_fix({
-                "incident_id":    incident.get("incident_id", ""),
-                "iflow_id":       incident.get("iflow_id"),
-                "fix_applied":    fix_result.get("fix_applied"),
-                "deploy_success": fix_result.get("deploy_success"),
-                "success":        fix_result.get("success"),
-                "summary":        fix_summary[:300],
-            }))
-            upsert_fix_pattern({
-                "error_signature": self._classifier.error_signature(
-                    incident["iflow_id"], rca.get("error_type", ""), incident.get("error_message", "")
-                ),
-                "iflow_id":   incident["iflow_id"],
-                "error_type": rca.get("error_type", ""),
-                "root_cause": rca.get("root_cause", ""),
-                "fix_applied": rca.get("proposed_fix", ""),
-                "outcome":    "SUCCESS" if fix_result["success"] else "FAILED",
-                "key_steps":  fix_result.get("steps", []) if fix_result["success"] else [],
-            })
-            return final_status
+            _iflow_id = incident.get("iflow_id", "")
+            _lock = self._get_iflow_fix_lock(_iflow_id) if _iflow_id else None
+            if _lock:
+                try:
+                    await asyncio.wait_for(_lock.acquire(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[Gate] iFlow '%s' fix already in progress — deferring incident %s to AWAITING_APPROVAL",
+                        _iflow_id, incident.get("incident_id", ""),
+                    )
+                    update_incident(incident["incident_id"], {
+                        "status":        "AWAITING_APPROVAL",
+                        "pending_since": get_hana_timestamp(),
+                    })
+                    return "AWAITING_APPROVAL"
+            try:
+                logger.info("[Gate] AUTO-FIX (%.2f) → %s", confidence, incident["iflow_id"])
+                fix_result   = await self._fix.apply_fix(incident, rca)
+                fix_summary  = fix_result.get("summary", "")
+                retry_result = None
+                if fix_result["success"] and policy.get("replay_after_fix"):
+                    retry_result = await self._verifier.retry_failed_message(incident)
+                    if retry_result.get("summary"):
+                        fix_summary = f"{fix_summary}\nRetry: {retry_result['summary']}"
+                final_status = self._fix.determine_post_fix_status(
+                    fix_result["success"], policy,
+                    retry_result=retry_result, human_approved=False,
+                    failed_stage=fix_result.get("failed_stage", ""),
+                )
+                _resolved = final_status in {"FIX_VERIFIED", "HUMAN_INITIATED_FIX"}
+                update_incident(incident["incident_id"], {
+                    "status":               final_status,
+                    "fix_summary":          fix_summary,
+                    "resolved_at":          get_hana_timestamp() if _resolved else None,
+                    "verification_status":  "VERIFIED" if _resolved else "PENDING",
+                })
+                # ── Dispatch verification directly — no Solace round-trip ─────────
+                asyncio.create_task(self._handle_fix({
+                    "incident_id":    incident.get("incident_id", ""),
+                    "iflow_id":       incident.get("iflow_id"),
+                    "fix_applied":    fix_result.get("fix_applied"),
+                    "deploy_success": fix_result.get("deploy_success"),
+                    "success":        fix_result.get("success"),
+                    "summary":        fix_summary[:300],
+                }))
+                # Store what was actually done (agent summary) alongside the RCA proposed_fix.
+                # This makes future pattern reuse grounded in the executed change, not just the diagnosis.
+                _fix_applied_desc = (
+                    fix_result.get("summary") or rca.get("proposed_fix", "")
+                ).strip()[:1000]
+                upsert_fix_pattern({
+                    "error_signature": self._classifier.error_signature(
+                        incident["iflow_id"], rca.get("error_type", ""), incident.get("error_message", "")
+                    ),
+                    "iflow_id":   incident["iflow_id"],
+                    "error_type": rca.get("error_type", ""),
+                    "root_cause": rca.get("root_cause", ""),
+                    "fix_applied": _fix_applied_desc,
+                    "outcome":    "SUCCESS" if fix_result["success"] else "FAILED",
+                    "key_steps":  fix_result.get("steps", []) if fix_result["success"] else [],
+                })
+                return final_status
+            finally:
+                if _lock and _lock.locked():
+                    _lock.release()
 
         if confidence >= SUGGEST_FIX_CONFIDENCE:
             logger.info("[Gate] MEDIUM (%.2f) → awaiting approval: %s", confidence, incident["iflow_id"])
@@ -783,21 +816,42 @@ Rules:
             })
 
         # ── Unfixable detection ───────────────────────────────────────────────
-        # Signals that are unfixable regardless of where they appear (fix hint OR root cause).
+        # Clear-cut structural signals: these always require changes that cannot be
+        # expressed as iFlow XML property edits.
         _unfixable_signals = [
-            "jsonslurper", "try/catch", "try {", "groovy script", "switch to",
-            "rewrite the script", "modify the script", "update the script",
-            "add a router", "add router", "add content-based router",
-            "add an exception subprocess", "add exception subprocess",
-            "add a subprocess", "add new step", "add a new step",
-            "add a converter", "add json-to-xml", "add xml-to-json",
-            "upstream", "payload is not valid json", "empty payload",
-            "payload is empty", "non-json payload", "invalid json payload",
-            "content-type mismatch",
+            # Groovy code changes — only compound phrases, not "groovy script" alone
+            "jsonslurper",              # Groovy class reference → script code edit needed
+            "try/catch",                # Groovy exception block → code edit needed
+            "try {",                    # Groovy code block → code edit needed
+            "rewrite the script",
+            "rewrite the groovy",
+            "groovy script needs to",
+            "groovy script must",
+            "groovy script to add",
+            "groovy script to handle",
+            # Structural additions — none of these can be expressed as an XML property change
+            "add a router",
+            "add router",
+            "add content-based router",
+            "add an exception subprocess",
+            "add exception subprocess",
+            "add a subprocess",
+            "add new step",
+            "add a new step",
+            "add a new channel",
+            "add new channel",
+            "add a new adapter",
+            "add a converter",
+            "add json-to-xml converter",
+            "add xml-to-json converter",
+            # Unambiguous external-only fixes
+            "requires backend changes",
+            "backend team must",
+            "infrastructure change required",
         ]
-        # Signals that are only unfixable when the PROPOSED FIX itself requires a backend
-        # change. "backend response" / "backend returns" in the ROOT CAUSE merely describe
-        # what the backend did — the adapter configuration may still be fixable via iFlow XML.
+        # Only unfixable when the PROPOSED FIX (not just the root cause) mentions these.
+        # "backend response/returns" in the root cause merely describes what happened —
+        # the adapter configuration may still be fixable via iFlow XML.
         _fix_only_signals = ["backend returns", "backend response"]
         _fix_hint   = (rca.get("proposed_fix") or "").lower()
         _rc_hint    = (rca.get("root_cause") or "").lower()
@@ -875,150 +929,183 @@ Rules:
                     "incident":       get_incident_by_id(incident_id) or working_incident,
                 }
 
-        self._set_progress(
-            incident_id, "Downloading iFlow configuration…", step_base + 1, total,
-            iflow_id=iflow_id,
-            root_cause=working_incident.get("root_cause"),
-            proposed_fix=working_incident.get("proposed_fix"),
-            rca_confidence=working_incident.get("rca_confidence"),
-            error_type=working_incident.get("error_type"),
-        )
-        update_incident(incident_id, {"status": "FIX_IN_PROGRESS"})
-
-        # ── Snapshot iFlow before modification ────────────────────────────────
-        if iflow_id and not deploy_only:
-            await self._fix.capture_snapshot(iflow_id, incident_id)
-
-        # ── Apply fix or deploy-only ──────────────────────────────────────────
-        if deploy_only:
+        # Serialise concurrent fixes for the same iFlow artifact — a second error type
+        # arriving while a fix is in progress would otherwise overwrite the first fix.
+        _fix_lock = self._get_iflow_fix_lock(iflow_id) if iflow_id else None
+        if _fix_lock:
+            try:
+                await asyncio.wait_for(_fix_lock.acquire(), timeout=60.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[FIX] iFlow '%s' lock timeout — concurrent fix still running after 60 s. "
+                    "incident=%s returning lock_timeout.",
+                    iflow_id, incident_id,
+                )
+                return {
+                    "incident_id":    incident_id,
+                    "iflow_id":       iflow_id,
+                    "status":         "FIX_FAILED",
+                    "success":        False,
+                    "fix_applied":    False,
+                    "deploy_success": False,
+                    "failed_stage":   "lock_timeout",
+                    "summary": (
+                        f"Another fix is already running for iFlow '{iflow_id}'. "
+                        "The concurrent fix is taking longer than 60 s. Please retry."
+                    ),
+                    "incident": get_incident_by_id(incident_id) or working_incident,
+                }
+        try:
             self._set_progress(
-                incident_id, "Deploying iFlow (update already applied)…", step_base + 2, total
-            )
-            fix_result = await self._fix.ask_deploy_only(
+                incident_id, "Downloading iFlow configuration…", step_base + 1, total,
                 iflow_id=iflow_id,
-                user_id="system_autofix",
-                timestamp=get_hana_timestamp(),
+                root_cause=working_incident.get("root_cause"),
+                proposed_fix=working_incident.get("proposed_fix"),
+                rca_confidence=working_incident.get("rca_confidence"),
+                error_type=working_incident.get("error_type"),
             )
-        else:
-            _fix_step = step_base + 2
-            self._set_progress(incident_id, "Applying fix and deploying iFlow…", _fix_step, total)
+            update_incident(incident_id, {"status": "FIX_IN_PROGRESS"})
 
-            def _fix_progress(label: str) -> None:
-                self._set_progress(incident_id, label, _fix_step, total)
+            # ── Snapshot iFlow before modification ────────────────────────────
+            if iflow_id and not deploy_only:
+                await self._fix.capture_snapshot(iflow_id, incident_id)
 
-            fix_result = await self._fix.apply_fix(working_incident, rca, progress_fn=_fix_progress)
+            # ── Apply fix or deploy-only ──────────────────────────────────────
+            if deploy_only:
+                self._set_progress(
+                    incident_id, "Deploying iFlow (update already applied)…", step_base + 2, total
+                )
+                fix_result = await self._fix.ask_deploy_only(
+                    iflow_id=iflow_id,
+                    user_id="system_autofix",
+                    timestamp=get_hana_timestamp(),
+                )
+            else:
+                _fix_step = step_base + 2
+                self._set_progress(incident_id, "Applying fix and deploying iFlow…", _fix_step, total)
 
-        policy       = self.get_remediation_policy(working_incident, rca)
-        fix_summary  = fix_result.get("summary", "") or ""
-        retry_result = None
+                def _fix_progress(label: str) -> None:
+                    self._set_progress(incident_id, label, _fix_step, total)
 
-        if fix_result.get("failed_stage") == "deploy" or (
-            fix_result.get("fix_applied") and not fix_result.get("deploy_success")
-        ):
-            deploy_error_text = await self._fix.get_deploy_error_details(iflow_id)
-            if deploy_error_text:
-                fix_result["technical_details"] = deploy_error_text[:1500]
-                fix_summary = (
-                    f"{fix_summary}\nDeployment error details: {deploy_error_text[:800]}"
-                    if fix_summary else deploy_error_text[:800]
+                fix_result = await self._fix.apply_fix(working_incident, rca, progress_fn=_fix_progress)
+
+            policy       = self.get_remediation_policy(working_incident, rca)
+            fix_summary  = fix_result.get("summary", "") or ""
+            retry_result = None
+
+            if fix_result.get("failed_stage") == "deploy" or (
+                fix_result.get("fix_applied") and not fix_result.get("deploy_success")
+            ):
+                deploy_error_text = await self._fix.get_deploy_error_details(iflow_id)
+                if deploy_error_text:
+                    fix_result["technical_details"] = deploy_error_text[:1500]
+                    fix_summary = (
+                        f"{fix_summary}\nDeployment error details: {deploy_error_text[:800]}"
+                        if fix_summary else deploy_error_text[:800]
+                    )
+
+            # ── Post-fix replay ───────────────────────────────────────────────
+            replay_success = False
+            replay_skipped = False
+            if fix_result.get("success"):
+                self._set_progress(
+                    incident_id, "Validating fix — replaying failed message…", total, total
+                )
+                retry_result  = await self._verifier.retry_failed_message(working_incident)
+                replay_success = retry_result.get("success", False)
+                replay_skipped = retry_result.get("skipped", False)
+                if retry_result.get("summary"):
+                    fix_summary = f"{fix_summary}\nReplay: {retry_result['summary']}"
+
+            if fix_result.get("success") and not replay_success and not replay_skipped:
+                final_status = "FIX_DEPLOYED"
+            else:
+                final_status = self._fix.determine_post_fix_status(
+                    fix_result.get("success", False),
+                    policy,
+                    retry_result=retry_result,
+                    failed_stage=fix_result.get("failed_stage", ""),
+                    human_approved=human_approved,
                 )
 
-        # ── Post-fix replay ───────────────────────────────────────────────────
-        replay_success = False
-        replay_skipped = False
-        if fix_result.get("success"):
+            technical_details = fix_result.get("technical_details", "")
+            if technical_details and not fix_result.get("success"):
+                fix_summary = (
+                    f"{fix_summary}\nTechnical detail: {technical_details}"
+                    if fix_summary else technical_details
+                )
+
+            failed_stage = fix_result.get("failed_stage", "")
+            done_step = (
+                "Fix applied and validated successfully" if fix_result.get("success") and replay_success
+                else ("Fix deployed — awaiting message verification" if fix_result.get("success")
+                      else f"Fix failed — stage: {failed_stage}" if failed_stage else "Fix failed")
+            )
             self._set_progress(
-                incident_id, "Validating fix — replaying failed message…", total, total
-            )
-            retry_result  = await self._verifier.retry_failed_message(working_incident)
-            replay_success = retry_result.get("success", False)
-            replay_skipped = retry_result.get("skipped", False)
-            if retry_result.get("summary"):
-                fix_summary = f"{fix_summary}\nReplay: {retry_result['summary']}"
-
-        if fix_result.get("success") and not replay_success and not replay_skipped:
-            final_status = "FIX_DEPLOYED"
-        else:
-            final_status = self._fix.determine_post_fix_status(
-                fix_result.get("success", False),
-                policy,
-                retry_result=retry_result,
-                failed_stage=fix_result.get("failed_stage", ""),
-                human_approved=human_approved,
+                incident_id, done_step, total, total, status=final_status,
+                failed_stage=failed_stage or None,
+                technical_details=technical_details[:300] if technical_details else None,
             )
 
-        technical_details = fix_result.get("technical_details", "")
-        if technical_details and not fix_result.get("success"):
-            fix_summary = (
-                f"{fix_summary}\nTechnical detail: {technical_details}"
-                if fix_summary else technical_details
-            )
-
-        failed_stage = fix_result.get("failed_stage", "")
-        done_step = (
-            "Fix applied and validated successfully" if fix_result.get("success") and replay_success
-            else ("Fix deployed — awaiting message verification" if fix_result.get("success")
-                  else f"Fix failed — stage: {failed_stage}" if failed_stage else "Fix failed")
-        )
-        self._set_progress(
-            incident_id, done_step, total, total, status=final_status,
-            failed_stage=failed_stage or None,
-            technical_details=technical_details[:300] if technical_details else None,
-        )
-
-        update_incident(incident_id, {
-            "status":               final_status,
-            "fix_summary":          fix_summary,
-            "last_failed_stage":    failed_stage or None,
-            "resolved_at":          get_hana_timestamp() if final_status in {"FIX_VERIFIED", "HUMAN_INITIATED_FIX"} else None,
-            "verification_status":  "VERIFIED" if final_status in {"FIX_VERIFIED", "HUMAN_INITIATED_FIX"} else "PENDING",
-            "root_cause":           rca.get("root_cause", ""),
-            "proposed_fix":         rca.get("proposed_fix", ""),
-            "rca_confidence":       rca.get("confidence", 0.0),
-            "affected_component":   rca.get("affected_component", ""),
-            "consecutive_failures": 0 if fix_result.get("success") else (
-                (int(working_incident.get("consecutive_failures") or 0)) + 1
-            ),
-        })
-        upsert_fix_pattern(
-            {
-                "error_signature": self._classifier.error_signature(
-                    working_incident.get("iflow_id", ""),
-                    rca.get("error_type", ""),
-                    working_incident.get("error_message", ""),
+            update_incident(incident_id, {
+                "status":               final_status,
+                "fix_summary":          fix_summary,
+                "last_failed_stage":    failed_stage or None,
+                "resolved_at":          get_hana_timestamp() if final_status in {"FIX_VERIFIED", "HUMAN_INITIATED_FIX"} else None,
+                "verification_status":  "VERIFIED" if final_status in {"FIX_VERIFIED", "HUMAN_INITIATED_FIX"} else "PENDING",
+                "root_cause":           rca.get("root_cause", ""),
+                "proposed_fix":         rca.get("proposed_fix", ""),
+                "rca_confidence":       rca.get("confidence", 0.0),
+                "affected_component":   rca.get("affected_component", ""),
+                "consecutive_failures": 0 if fix_result.get("success") else (
+                    (int(working_incident.get("consecutive_failures") or 0)) + 1
                 ),
-                "iflow_id":   working_incident.get("iflow_id", ""),
-                "error_type": rca.get("error_type", ""),
-                "root_cause": rca.get("root_cause", ""),
-                "fix_applied": rca.get("proposed_fix", ""),
-                "outcome":    "SUCCESS" if fix_result.get("success") else "FAILED",
-                "key_steps":  fix_result.get("steps", []) if fix_result.get("success") else [],
-            },
-            replay_success=replay_success,
-        )
-        logger.info(
-            "[FIX_OUTCOME] incident=%s iflow=%s status=%s fix_applied=%s deploy_success=%s "
-            "replay=%s failed_stage=%s | summary=%.300s",
-            incident_id, iflow_id, final_status,
-            fix_result.get("fix_applied"), fix_result.get("deploy_success"),
-            replay_success, fix_result.get("failed_stage", ""), fix_summary,
-        )
-        refreshed = get_incident_by_id(incident_id) or working_incident
-        return {
-            "incident_id":      incident_id,
-            "iflow_id":         refreshed.get("iflow_id"),
-            "status":           final_status,
-            "success":          fix_result.get("success", False),
-            "fix_applied":      fix_result.get("fix_applied", False),
-            "deploy_success":   fix_result.get("deploy_success", False),
-            "failed_stage":     fix_result.get("failed_stage"),
-            "technical_details": fix_result.get("technical_details", ""),
-            "summary":          fix_summary,
-            "root_cause":       refreshed.get("root_cause"),
-            "proposed_fix":     refreshed.get("proposed_fix"),
-            "confidence":       refreshed.get("rca_confidence"),
-            "incident":         refreshed,
-        }
+            })
+            _fix_applied_desc2 = (
+                fix_result.get("summary") or rca.get("proposed_fix", "")
+            ).strip()[:1000]
+            upsert_fix_pattern(
+                {
+                    "error_signature": self._classifier.error_signature(
+                        working_incident.get("iflow_id", ""),
+                        rca.get("error_type", ""),
+                        working_incident.get("error_message", ""),
+                    ),
+                    "iflow_id":   working_incident.get("iflow_id", ""),
+                    "error_type": rca.get("error_type", ""),
+                    "root_cause": rca.get("root_cause", ""),
+                    "fix_applied": _fix_applied_desc2,
+                    "outcome":    "SUCCESS" if fix_result.get("success") else "FAILED",
+                    "key_steps":  fix_result.get("steps", []) if fix_result.get("success") else [],
+                },
+                replay_success=replay_success,
+            )
+            logger.info(
+                "[FIX_OUTCOME] incident=%s iflow=%s status=%s fix_applied=%s deploy_success=%s "
+                "replay=%s failed_stage=%s | summary=%.300s",
+                incident_id, iflow_id, final_status,
+                fix_result.get("fix_applied"), fix_result.get("deploy_success"),
+                replay_success, fix_result.get("failed_stage", ""), fix_summary,
+            )
+            refreshed = get_incident_by_id(incident_id) or working_incident
+            return {
+                "incident_id":      incident_id,
+                "iflow_id":         refreshed.get("iflow_id"),
+                "status":           final_status,
+                "success":          fix_result.get("success", False),
+                "fix_applied":      fix_result.get("fix_applied", False),
+                "deploy_success":   fix_result.get("deploy_success", False),
+                "failed_stage":     fix_result.get("failed_stage"),
+                "technical_details": fix_result.get("technical_details", ""),
+                "summary":          fix_summary,
+                "root_cause":       refreshed.get("root_cause"),
+                "proposed_fix":     refreshed.get("proposed_fix"),
+                "confidence":       refreshed.get("rca_confidence"),
+                "incident":         refreshed,
+            }
+        finally:
+            if _fix_lock and _fix_lock.locked():
+                _fix_lock.release()
 
     # ────────────────────────────────────────────
     # INCIDENT VIEW MODEL
@@ -1294,6 +1381,14 @@ Rules:
         Route a queue message to the correct stage handler based on the 'stage' field.
         Messages from SAP CPI have no 'stage' field — they default to 'observed'.
         """
+        # Guard: if specialist agents are still initialising, re-queue and back off.
+        # This prevents RuntimeError("MCP agent is not ready") from silently dropping messages.
+        if not self._agents_ready:
+            logger.info("[Orchestrator] Agents not ready — re-queuing message (stage=%s)", message.get("stage", "observed"))
+            await asyncio.sleep(2)
+            await self._put_local_queue_message(message)
+            return
+
         stage = message.get("stage", "observed")
         try:
             if stage == "observed":
@@ -1423,6 +1518,22 @@ Rules:
                 await self.process_detected_error(normalized)
         except Exception as exc:
             logger.error("[Orchestrator] Stage '%s' handler error: %s", stage, exc)
+            # Create a PARSE_FAILED incident so the failure is visible in the dashboard
+            # instead of being silently dropped.
+            if stage == "observed":
+                try:
+                    _raw = json.dumps(message)[:2000] if message else ""
+                    create_incident({
+                        "incident_id":   str(uuid.uuid4()),
+                        "iflow_id":      message.get("iflow_id") or message.get("IntegrationFlowName") or "UNKNOWN",
+                        "message_guid":  message.get("message_guid") or message.get("MessageGuid") or "",
+                        "status":        "PARSE_FAILED",
+                        "error_type":    "PARSE_FAILED",
+                        "error_message": f"AEM message could not be parsed: {exc} | raw={_raw[:500]}",
+                        "created_at":    get_hana_timestamp(),
+                    })
+                except Exception as _db_exc:
+                    logger.error("[Orchestrator] Failed to create PARSE_FAILED incident: %s", _db_exc)
 
     async def _handle_fix(self, message: Dict[str, Any]) -> None:
         """
